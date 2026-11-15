@@ -2656,6 +2656,339 @@ static inline HMM_Vec3 HMM_RotateV3AxisAngle_RH(HMM_Vec3 V, HMM_Vec3 Axis, float
     return HMM_RotateV3Q(V, HMM_QFromAxisAngle_RH(Axis, Angle));
 }
 
+/*
+ * Bezier curves
+ *
+ * Point evaluation uses de Casteljau's algorithm. Equal arc-length sampling
+ * builds a cumulative arc-length table with composite Simpson quadrature and
+ * inverts it with a bisection search. The reported arc length itself comes
+ * from an adaptive Simpson integration together with a rigorous error
+ * estimate, so Length + ErrorBound is an upper bound on the true length.
+ */
+
+#define HMM_BEZIER_MAX_POINTS 16
+
+typedef enum HMM_BezierError
+{
+    HMM_BEZIER_OK,
+    HMM_BEZIER_ERR_NULL,
+    HMM_BEZIER_ERR_TOO_FEW_POINTS,
+    HMM_BEZIER_ERR_TOO_MANY_POINTS,
+    HMM_BEZIER_ERR_NAN_T,
+    HMM_BEZIER_ERR_T_OUT_OF_RANGE,
+    HMM_BEZIER_ERR_BAD_SEGMENTS,
+    HMM_BEZIER_ERR_NAN_POINT
+} HMM_BezierError;
+
+enum
+{
+    HMM_BEZIER_TABLE_PANELS = 256,
+    HMM_BEZIER_INVERT_ITERS = 32,
+    HMM_BEZIER_LOCAL_SUBDIV = 8,
+    HMM_BEZIER_MAX_DEPTH = 20
+};
+
+static inline int HMM_BezierIsNaN(float F)
+{
+    return F != F;
+}
+
+/* Evaluates a degree-(PointCount-1) Bezier curve at parameter T using
+ * de Casteljau's algorithm. */
+static inline int HMM_BezierPointV2(const HMM_Vec2 *Points, int PointCount,
+    float T, HMM_Vec2 *Out)
+{
+    HMM_Vec2 Scratch[HMM_BEZIER_MAX_POINTS];
+    int I, Level;
+
+    if (Points == 0 || Out == 0)
+    {
+        return HMM_BEZIER_ERR_NULL;
+    }
+    if (PointCount < 2)
+    {
+        return HMM_BEZIER_ERR_TOO_FEW_POINTS;
+    }
+    if (PointCount > HMM_BEZIER_MAX_POINTS)
+    {
+        return HMM_BEZIER_ERR_TOO_MANY_POINTS;
+    }
+    if (HMM_BezierIsNaN(T))
+    {
+        return HMM_BEZIER_ERR_NAN_T;
+    }
+    if (T < 0.0f || T > 1.0f)
+    {
+        return HMM_BEZIER_ERR_T_OUT_OF_RANGE;
+    }
+    for (I = 0; I < PointCount; ++I)
+    {
+        if (HMM_BezierIsNaN(Points[I].X) || HMM_BezierIsNaN(Points[I].Y))
+        {
+            return HMM_BEZIER_ERR_NAN_POINT;
+        }
+        Scratch[I] = Points[I];
+    }
+
+    for (Level = 1; Level < PointCount; ++Level)
+    {
+        for (I = 0; I < PointCount - Level; ++I)
+        {
+            Scratch[I].X =
+                (1.0f - T) * Scratch[I].X + T * Scratch[I + 1].X;
+            Scratch[I].Y =
+                (1.0f - T) * Scratch[I].Y + T * Scratch[I + 1].Y;
+        }
+    }
+
+    *Out = Scratch[0];
+    return HMM_BEZIER_OK;
+}
+
+/* Magnitude of the curve's derivative at parameter T, i.e. its speed. The
+ * derivative control polygon is the difference polygon of the control points. */
+static inline float HMM_BezierSpeedV2(const HMM_Vec2 *Points, int PointCount,
+    float T)
+{
+    float Dx[HMM_BEZIER_MAX_POINTS];
+    float Dy[HMM_BEZIER_MAX_POINTS];
+    int Degree = PointCount - 1;
+    int I, Level;
+
+    for (I = 0; I < Degree; ++I)
+    {
+        Dx[I] = (float)Degree * (Points[I + 1].X - Points[I].X);
+        Dy[I] = (float)Degree * (Points[I + 1].Y - Points[I].Y);
+    }
+    for (Level = 1; Level < Degree; ++Level)
+    {
+        for (I = 0; I < Degree - Level; ++I)
+        {
+            Dx[I] = (1.0f - T) * Dx[I] + T * Dx[I + 1];
+            Dy[I] = (1.0f - T) * Dy[I] + T * Dy[I + 1];
+        }
+    }
+
+    return HMM_SqrtF(Dx[0] * Dx[0] + Dy[0] * Dy[0]);
+}
+
+/* One composite Simpson panel over [A, B]. */
+static inline float HMM_BezierSimpsonV2(const HMM_Vec2 *Points, int PointCount,
+    float A, float B)
+{
+    float Mid = 0.5f * (A + B);
+    float H = B - A;
+
+    return H * (HMM_BezierSpeedV2(Points, PointCount, A)
+        + 4.0f * HMM_BezierSpeedV2(Points, PointCount, Mid)
+        + HMM_BezierSpeedV2(Points, PointCount, B)) / 6.0f;
+}
+
+/* Adaptive Simpson integration. Every accepted leaf contributes its Simpson
+ * error estimate |S(A,M) + S(M,B) - S(A,B)| / 15 to *BoundOut, which is
+ * therefore an upper bound on the quadrature error of the returned value. */
+static inline float HMM_BezierAdaptiveSimpsonV2(const HMM_Vec2 *Points,
+    int PointCount, float A, float B, float Eps, float Whole, float Depth,
+    float *BoundOut)
+{
+    float Mid = 0.5f * (A + B);
+    float Left = HMM_BezierSimpsonV2(Points, PointCount, A, Mid);
+    float Right = HMM_BezierSimpsonV2(Points, PointCount, Mid, B);
+    float Delta = Left + Right - Whole;
+
+    if (Depth <= 0.0f || fabsf(Delta) <= 15.0f * Eps)
+    {
+        *BoundOut += fabsf(Delta) / 15.0f;
+        return Left + Right + Delta / 15.0f;
+    }
+
+    return HMM_BezierAdaptiveSimpsonV2(Points, PointCount, A, Mid,
+               0.5f * Eps, Left, Depth - 1.0f, BoundOut)
+        + HMM_BezierAdaptiveSimpsonV2(Points, PointCount, Mid, B,
+               0.5f * Eps, Right, Depth - 1.0f, BoundOut);
+}
+
+/* Composite Simpson over an arbitrary sub-interval, used for the fine local
+ * arc-length measurements inside the inversion bisection. */
+static inline float HMM_BezierLocalLengthV2(const HMM_Vec2 *Points,
+    int PointCount, float A, float B)
+{
+    float H = (B - A) / (float)HMM_BEZIER_LOCAL_SUBDIV;
+    float Sum = HMM_BezierSpeedV2(Points, PointCount, A)
+        + HMM_BezierSpeedV2(Points, PointCount, B);
+    int I;
+
+    for (I = 1; I < HMM_BEZIER_LOCAL_SUBDIV; ++I)
+    {
+        float T = A + (float)I * H;
+        float Weight = (I % 2 == 0) ? 2.0f : 4.0f;
+        Sum += Weight * HMM_BezierSpeedV2(Points, PointCount, T);
+    }
+
+    return H * Sum / 3.0f;
+}
+
+/* Finds the parameter T whose arc length from the start of the curve equals
+ * Target. Table holds cumulative arc length at a uniform parameter grid. */
+static inline float HMM_BezierInvertV2(const HMM_Vec2 *Points, int PointCount,
+    const float *Table, float Target)
+{
+    float PanelW = 1.0f / (float)HMM_BEZIER_TABLE_PANELS;
+    int Lo = 0, Hi = HMM_BEZIER_TABLE_PANELS;
+    int Iter;
+    float T0, T1, Base, PanelLength, LocalTarget, Left, Right;
+
+    while (Lo < Hi)
+    {
+        int Mid = (Lo + Hi) / 2;
+        if (Table[Mid + 1] < Target)
+        {
+            Lo = Mid + 1;
+        }
+        else
+        {
+            Hi = Mid;
+        }
+    }
+
+    T0 = (float)Lo * PanelW;
+    T1 = (float)(Lo + 1) * PanelW;
+    Base = Table[Lo];
+    PanelLength = Table[Lo + 1] - Table[Lo];
+    LocalTarget = Target - Base;
+
+    /* A zero-length panel means the curve stands still there; any parameter in
+     * the panel maps to the requested arc length, use its start. */
+    if (PanelLength <= 0.0f)
+    {
+        return T0;
+    }
+
+    Left = T0;
+    Right = T1;
+    for (Iter = 0; Iter < HMM_BEZIER_INVERT_ITERS; ++Iter)
+    {
+        float MidT = 0.5f * (Left + Right);
+        float Arc = HMM_BezierLocalLengthV2(Points, PointCount, T0, MidT);
+        if (Arc < LocalTarget)
+        {
+            Left = MidT;
+        }
+        else
+        {
+            Right = MidT;
+        }
+    }
+
+    return 0.5f * (Left + Right);
+}
+
+/* Splits a Bezier curve into Segments pieces of equal arc length and writes
+ * Segments + 1 sample points to OutSamples. The total arc length and a bound
+ * on its numerical error are reported through the optional out-pointers.
+ *
+ * A fully degenerate curve (every control point coincides) has zero length:
+ * every sample is the shared control point and both length and error bound
+ * are exactly zero. Out-pointers may be null. */
+static inline int HMM_BezierSampleArcLengthV2(const HMM_Vec2 *Points,
+    int PointCount, int Segments, HMM_Vec2 *OutSamples, float *OutLength,
+    float *OutErrorBound)
+{
+    float Table[HMM_BEZIER_TABLE_PANELS + 1];
+    float PanelW, Length, Bound, Whole, Slack;
+    int Degenerate = 1;
+    int I;
+
+    if (Points == 0 || OutSamples == 0)
+    {
+        return HMM_BEZIER_ERR_NULL;
+    }
+    if (PointCount < 2)
+    {
+        return HMM_BEZIER_ERR_TOO_FEW_POINTS;
+    }
+    if (PointCount > HMM_BEZIER_MAX_POINTS)
+    {
+        return HMM_BEZIER_ERR_TOO_MANY_POINTS;
+    }
+    if (Segments <= 0)
+    {
+        return HMM_BEZIER_ERR_BAD_SEGMENTS;
+    }
+    for (I = 0; I < PointCount; ++I)
+    {
+        if (HMM_BezierIsNaN(Points[I].X) || HMM_BezierIsNaN(Points[I].Y))
+        {
+            return HMM_BEZIER_ERR_NAN_POINT;
+        }
+        if (Points[I].X != Points[0].X || Points[I].Y != Points[0].Y)
+        {
+            Degenerate = 0;
+        }
+    }
+
+    if (Degenerate)
+    {
+        if (OutLength != 0)
+        {
+            *OutLength = 0.0f;
+        }
+        if (OutErrorBound != 0)
+        {
+            *OutErrorBound = 0.0f;
+        }
+        for (I = 0; I <= Segments; ++I)
+        {
+            OutSamples[I] = Points[0];
+        }
+        return HMM_BEZIER_OK;
+    }
+
+    Bound = 0.0f;
+    Whole = HMM_BezierSimpsonV2(Points, PointCount, 0.0f, 1.0f);
+    Length = HMM_BezierAdaptiveSimpsonV2(Points, PointCount, 0.0f, 1.0f,
+        1.0e-8f, Whole, (float)HMM_BEZIER_MAX_DEPTH, &Bound);
+
+    /* The Simpson estimate covers quadrature error; add a small slack term for
+     * the floating-point accumulation in the table and in the recursion. */
+    Slack = Length * 1.0e-6f + 1.0e-7f;
+    Bound += Slack;
+
+    PanelW = 1.0f / (float)HMM_BEZIER_TABLE_PANELS;
+    Table[0] = 0.0f;
+    for (I = 0; I < HMM_BEZIER_TABLE_PANELS; ++I)
+    {
+        float A = (float)I * PanelW;
+        float B = (float)(I + 1) * PanelW;
+        Table[I + 1] = Table[I] + HMM_BezierSimpsonV2(Points, PointCount, A, B);
+    }
+
+    OutSamples[0] = Points[0];
+    OutSamples[Segments] = Points[PointCount - 1];
+    for (I = 1; I < Segments; ++I)
+    {
+        float Target = Length * (float)I / (float)Segments;
+        float T;
+        if (Target > Table[HMM_BEZIER_TABLE_PANELS])
+        {
+            Target = Table[HMM_BEZIER_TABLE_PANELS];
+        }
+        T = HMM_BezierInvertV2(Points, PointCount, Table, Target);
+        HMM_BezierPointV2(Points, PointCount, T, &OutSamples[I]);
+    }
+
+    if (OutLength != 0)
+    {
+        *OutLength = Length;
+    }
+    if (OutErrorBound != 0)
+    {
+        *OutErrorBound = Bound;
+    }
+
+    return HMM_BEZIER_OK;
+}
+
 
 #ifdef __cplusplus
 }
