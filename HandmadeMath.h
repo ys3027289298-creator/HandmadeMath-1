@@ -1103,6 +1103,139 @@ static inline HMM_Vec4 HMM_LerpV4(HMM_Vec4 A, float Time, HMM_Vec4 B)
 }
 
 /*
+ * Spring integration
+ *
+ * Damped harmonic oscillator for UI-style animation. A spring pulls a scalar
+ * position P toward a target Rest with stiffness Stiffness (k) and drag
+ * Damping (c):
+ *
+ *   P'' = Stiffness * (Rest - P) - Damping * P'
+ *
+ * HMM_SpringStep advances one HMM_Spring state by DeltaTime using semi-implicit
+ * (symplectic) Euler integration with adaptive sub-stepping. The frame step
+ * is automatically split into the smallest number of equal sub-steps whose
+ * length h satisfies the semi-implicit Euler stability condition
+ *
+ *   h*h * Stiffness + 2.0f * h * Damping <= HMM_SPRING_STABILITY_LIMIT
+ *
+ * (the exact stability boundary is 4.0; a 0.9 safety margin is used so that
+ * float rounding can never land on the boundary). If no stable sub-step count
+ * exists below HMM_SPRING_MAX_SUBSTEPS, or any parameter/state is non-finite,
+ * an HMM_SPRING_ERR_* code is returned and the state is left untouched. The
+ * integrator therefore reports divergent configurations instead of producing
+ * NaN or infinity.
+ *
+ * Return codes, in reporting precedence order:
+ *   HMM_SPRING_OK                 success
+ *   HMM_SPRING_ERR_NULL           State is a null pointer
+ *   HMM_SPRING_ERR_BAD_PARAM      a parameter, state or DeltaTime is non-finite,
+ *                                 Stiffness or Damping is negative, or
+ *                                 DeltaTime is negative
+ *   HMM_SPRING_ERR_UNSTABLE       the stability condition cannot be satisfied
+ *                                 within HMM_SPRING_MAX_SUBSTEPS sub-steps
+ */
+
+#define HMM_SPRING_OK 0
+#define HMM_SPRING_ERR_NULL 1
+#define HMM_SPRING_ERR_BAD_PARAM 2
+#define HMM_SPRING_ERR_UNSTABLE 3
+
+/* Exact stability boundary of semi-implicit Euler is 4.0; stay 10% inside it. */
+#define HMM_SPRING_STABILITY_LIMIT 3.6f
+#define HMM_SPRING_MAX_SUBSTEPS 256
+
+typedef struct HMM_Spring
+{
+    float P;
+    float V;
+} HMM_Spring;
+
+typedef struct HMM_SpringConfig
+{
+    float Stiffness;
+    float Damping;
+    float Rest;
+} HMM_SpringConfig;
+
+/* Returns 1 when Value is a finite float (not NaN and not +/-infinity). */
+COVERAGE(HMM_SpringIsFinite, 1)
+static inline int HMM_SpringIsFinite(float Value)
+{
+    ASSERT_COVERED(HMM_SpringIsFinite);
+    return (Value == Value) && (Value - Value == 0.0f);
+}
+
+COVERAGE(HMM_SpringStep, 1)
+static inline int HMM_SpringStep(HMM_Spring *State, HMM_SpringConfig Config, float DeltaTime)
+{
+    ASSERT_COVERED(HMM_SpringStep);
+
+    int SubSteps;
+    float SubTime;
+    int Index;
+    float Position;
+    float Velocity;
+
+    if (State == 0)
+    {
+        return HMM_SPRING_ERR_NULL;
+    }
+
+    if (!HMM_SpringIsFinite(Config.Stiffness) || Config.Stiffness < 0.0f ||
+        !HMM_SpringIsFinite(Config.Damping) || Config.Damping < 0.0f ||
+        !HMM_SpringIsFinite(Config.Rest) ||
+        !HMM_SpringIsFinite(DeltaTime) || DeltaTime < 0.0f ||
+        !HMM_SpringIsFinite(State->P) || !HMM_SpringIsFinite(State->V))
+    {
+        return HMM_SPRING_ERR_BAD_PARAM;
+    }
+
+    if (DeltaTime == 0.0f)
+    {
+        return HMM_SPRING_OK;
+    }
+
+    /* Adaptive sub-stepping: double the sub-step count until the stability
+       condition holds. Integer-only arithmetic keeps the bound exact. */
+    SubSteps = 1;
+    SubTime = DeltaTime;
+    while ((SubTime * SubTime) * Config.Stiffness +
+               (2.0f * SubTime) * Config.Damping >
+           HMM_SPRING_STABILITY_LIMIT)
+    {
+        SubSteps *= 2;
+        if (SubSteps > HMM_SPRING_MAX_SUBSTEPS)
+        {
+            return HMM_SPRING_ERR_UNSTABLE;
+        }
+        SubTime = DeltaTime / (float)SubSteps;
+    }
+
+    /* Integrate on locals so that a failing run never mutates the state. */
+    Position = State->P;
+    Velocity = State->V;
+
+    for (Index = 0; Index < SubSteps; ++Index)
+    {
+        /* Semi-implicit (symplectic) Euler: velocity first, then position. */
+        Velocity = Velocity +
+                   SubTime * (Config.Stiffness * (Config.Rest - Position) -
+                              Config.Damping * Velocity);
+        Position = Position + SubTime * Velocity;
+
+        if (!HMM_SpringIsFinite(Position) || !HMM_SpringIsFinite(Velocity))
+        {
+            return HMM_SPRING_ERR_UNSTABLE;
+        }
+    }
+
+    State->P = Position;
+    State->V = Velocity;
+
+    return HMM_SPRING_OK;
+}
+
+/*
  * SSE stuff
  */
 
