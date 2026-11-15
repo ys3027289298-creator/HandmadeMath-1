@@ -18,4 +18,5 @@
 #include "categories/Equality.h"
 #include "categories/Projection.h"
 #include "categories/Transformation.h"
+#include "categories/Splines.h"
 #include "categories/SSE.h"

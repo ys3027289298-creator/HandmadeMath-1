@@ -1103,6 +1103,338 @@ static inline HMM_Vec4 HMM_LerpV4(HMM_Vec4 A, float Time, HMM_Vec4 B)
 }
 
 /*
+ * Spline functions
+ *
+ * Catmull-Rom and uniform cubic B-spline evaluation over an arbitrary
+ * array of control points, intended for things like camera paths and
+ * animation curves. These functions reuse the existing vector types and
+ * never allocate memory.
+ *
+ * T is a global parameter in [0, 1] that is mapped uniformly across the
+ * segments of the spline. EndpointMode selects how the curve is handled
+ * at the ends of the point array:
+ *
+ *   HMM_SPLINE_ENDPOINT_CLAMP: the end points are repeated, so an open
+ *   curve is produced. Requires at least 2 points.
+ *
+ *   HMM_SPLINE_ENDPOINT_WRAP: the points are treated as a closed loop.
+ *   Requires at least 3 points.
+ *
+ * All spline functions return one of the HMM_SPLINE_ERR_* codes below.
+ * On any error, Out is left untouched. Errors are reported with the
+ * following precedence: HMM_SPLINE_ERR_NULL, HMM_SPLINE_ERR_BAD_ENDPOINT_MODE,
+ * HMM_SPLINE_ERR_TOO_FEW_POINTS, HMM_SPLINE_ERR_NAN_T,
+ * HMM_SPLINE_ERR_T_OUT_OF_RANGE, HMM_SPLINE_ERR_NAN_POINT.
+ */
+
+#define HMM_SPLINE_OK 0
+#define HMM_SPLINE_ERR_NULL 1
+#define HMM_SPLINE_ERR_BAD_ENDPOINT_MODE 2
+#define HMM_SPLINE_ERR_TOO_FEW_POINTS 3
+#define HMM_SPLINE_ERR_NAN_T 4
+#define HMM_SPLINE_ERR_T_OUT_OF_RANGE 5
+#define HMM_SPLINE_ERR_NAN_POINT 6
+
+#define HMM_SPLINE_ENDPOINT_CLAMP 0
+#define HMM_SPLINE_ENDPOINT_WRAP 1
+
+/* Maps the global parameter T to a segment and a local t in [0, 1], and
+   resolves the four control point indices for that segment. */
+COVERAGE(HMM_SplineSegment, 1)
+static inline int HMM_SplineSegment(int NumPoints, float T, int EndpointMode,
+    int *Index0, int *Index1, int *Index2, int *Index3, float *LocalT)
+{
+    ASSERT_COVERED(HMM_SplineSegment);
+
+    int NumSegments;
+    int Segment;
+    float Scaled;
+
+    if (EndpointMode != HMM_SPLINE_ENDPOINT_CLAMP && EndpointMode != HMM_SPLINE_ENDPOINT_WRAP)
+    {
+        return HMM_SPLINE_ERR_BAD_ENDPOINT_MODE;
+    }
+
+    if (NumPoints < ((EndpointMode == HMM_SPLINE_ENDPOINT_WRAP) ? 3 : 2))
+    {
+        return HMM_SPLINE_ERR_TOO_FEW_POINTS;
+    }
+
+    if (T != T) /* NaN */
+    {
+        return HMM_SPLINE_ERR_NAN_T;
+    }
+
+    if (T < 0.0f || T > 1.0f)
+    {
+        return HMM_SPLINE_ERR_T_OUT_OF_RANGE;
+    }
+
+    NumSegments = (EndpointMode == HMM_SPLINE_ENDPOINT_WRAP) ? NumPoints : NumPoints - 1;
+    Scaled = T * (float)NumSegments;
+    Segment = (int)Scaled;
+    if (Segment >= NumSegments) /* T == 1.0f lands past the last segment */
+    {
+        Segment = NumSegments - 1;
+    }
+    *LocalT = Scaled - (float)Segment;
+
+    if (EndpointMode == HMM_SPLINE_ENDPOINT_WRAP)
+    {
+        *Index0 = (Segment + NumPoints - 1) % NumPoints;
+        *Index1 = Segment;
+        *Index2 = (Segment + 1) % NumPoints;
+        *Index3 = (Segment + 2) % NumPoints;
+    }
+    else
+    {
+        *Index0 = (Segment > 0) ? Segment - 1 : 0;
+        *Index1 = Segment;
+        *Index2 = Segment + 1;
+        *Index3 = (Segment + 2 <= NumPoints - 1) ? Segment + 2 : NumPoints - 1;
+    }
+
+    return HMM_SPLINE_OK;
+}
+
+/* Returns 0 if any of the Count floats starting at Elements is NaN. */
+COVERAGE(HMM_SplinePointsValid, 1)
+static inline int HMM_SplinePointsValid(const float *Elements, int Count)
+{
+    ASSERT_COVERED(HMM_SplinePointsValid);
+
+    int I;
+    for (I = 0; I < Count; ++I)
+    {
+        if (Elements[I] != Elements[I]) /* NaN */
+        {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+COVERAGE(HMM_CatmullRomF, 1)
+static inline float HMM_CatmullRomF(float P0, float P1, float P2, float P3, float T)
+{
+    ASSERT_COVERED(HMM_CatmullRomF);
+
+    float T2 = T * T;
+    float T3 = T2 * T;
+
+    return 0.5f * ((2.0f * P1) + (-P0 + P2) * T +
+        (2.0f * P0 - 5.0f * P1 + 4.0f * P2 - P3) * T2 +
+        (-P0 + 3.0f * P1 - 3.0f * P2 + P3) * T3);
+}
+
+COVERAGE(HMM_BSplineF, 1)
+static inline float HMM_BSplineF(float P0, float P1, float P2, float P3, float T)
+{
+    ASSERT_COVERED(HMM_BSplineF);
+
+    float T2 = T * T;
+    float T3 = T2 * T;
+
+    return ((1.0f - 3.0f * T + 3.0f * T2 - T3) * P0 +
+        (4.0f - 6.0f * T2 + 3.0f * T3) * P1 +
+        (1.0f + 3.0f * T + 3.0f * T2 - 3.0f * T3) * P2 +
+        T3 * P3) / 6.0f;
+}
+
+COVERAGE(HMM_CatmullRomV2, 1)
+static inline int HMM_CatmullRomV2(const HMM_Vec2 *Points, int NumPoints, float T, int EndpointMode, HMM_Vec2 *Out)
+{
+    ASSERT_COVERED(HMM_CatmullRomV2);
+
+    int I0, I1, I2, I3;
+    float LocalT;
+    int Err;
+
+    if (Points == 0 || Out == 0)
+    {
+        return HMM_SPLINE_ERR_NULL;
+    }
+
+    Err = HMM_SplineSegment(NumPoints, T, EndpointMode, &I0, &I1, &I2, &I3, &LocalT);
+    if (Err != HMM_SPLINE_OK)
+    {
+        return Err;
+    }
+
+    if (!HMM_SplinePointsValid(&Points[0].Elements[0], NumPoints * 2))
+    {
+        return HMM_SPLINE_ERR_NAN_POINT;
+    }
+
+    Out->X = HMM_CatmullRomF(Points[I0].X, Points[I1].X, Points[I2].X, Points[I3].X, LocalT);
+    Out->Y = HMM_CatmullRomF(Points[I0].Y, Points[I1].Y, Points[I2].Y, Points[I3].Y, LocalT);
+
+    return HMM_SPLINE_OK;
+}
+
+COVERAGE(HMM_CatmullRomV3, 1)
+static inline int HMM_CatmullRomV3(const HMM_Vec3 *Points, int NumPoints, float T, int EndpointMode, HMM_Vec3 *Out)
+{
+    ASSERT_COVERED(HMM_CatmullRomV3);
+
+    int I0, I1, I2, I3;
+    float LocalT;
+    int Err;
+
+    if (Points == 0 || Out == 0)
+    {
+        return HMM_SPLINE_ERR_NULL;
+    }
+
+    Err = HMM_SplineSegment(NumPoints, T, EndpointMode, &I0, &I1, &I2, &I3, &LocalT);
+    if (Err != HMM_SPLINE_OK)
+    {
+        return Err;
+    }
+
+    if (!HMM_SplinePointsValid(&Points[0].Elements[0], NumPoints * 3))
+    {
+        return HMM_SPLINE_ERR_NAN_POINT;
+    }
+
+    Out->X = HMM_CatmullRomF(Points[I0].X, Points[I1].X, Points[I2].X, Points[I3].X, LocalT);
+    Out->Y = HMM_CatmullRomF(Points[I0].Y, Points[I1].Y, Points[I2].Y, Points[I3].Y, LocalT);
+    Out->Z = HMM_CatmullRomF(Points[I0].Z, Points[I1].Z, Points[I2].Z, Points[I3].Z, LocalT);
+
+    return HMM_SPLINE_OK;
+}
+
+COVERAGE(HMM_CatmullRomV4, 1)
+static inline int HMM_CatmullRomV4(const HMM_Vec4 *Points, int NumPoints, float T, int EndpointMode, HMM_Vec4 *Out)
+{
+    ASSERT_COVERED(HMM_CatmullRomV4);
+
+    int I0, I1, I2, I3;
+    float LocalT;
+    int Err;
+
+    if (Points == 0 || Out == 0)
+    {
+        return HMM_SPLINE_ERR_NULL;
+    }
+
+    Err = HMM_SplineSegment(NumPoints, T, EndpointMode, &I0, &I1, &I2, &I3, &LocalT);
+    if (Err != HMM_SPLINE_OK)
+    {
+        return Err;
+    }
+
+    if (!HMM_SplinePointsValid(&Points[0].Elements[0], NumPoints * 4))
+    {
+        return HMM_SPLINE_ERR_NAN_POINT;
+    }
+
+    Out->X = HMM_CatmullRomF(Points[I0].X, Points[I1].X, Points[I2].X, Points[I3].X, LocalT);
+    Out->Y = HMM_CatmullRomF(Points[I0].Y, Points[I1].Y, Points[I2].Y, Points[I3].Y, LocalT);
+    Out->Z = HMM_CatmullRomF(Points[I0].Z, Points[I1].Z, Points[I2].Z, Points[I3].Z, LocalT);
+    Out->W = HMM_CatmullRomF(Points[I0].W, Points[I1].W, Points[I2].W, Points[I3].W, LocalT);
+
+    return HMM_SPLINE_OK;
+}
+
+COVERAGE(HMM_BSplineV2, 1)
+static inline int HMM_BSplineV2(const HMM_Vec2 *Points, int NumPoints, float T, int EndpointMode, HMM_Vec2 *Out)
+{
+    ASSERT_COVERED(HMM_BSplineV2);
+
+    int I0, I1, I2, I3;
+    float LocalT;
+    int Err;
+
+    if (Points == 0 || Out == 0)
+    {
+        return HMM_SPLINE_ERR_NULL;
+    }
+
+    Err = HMM_SplineSegment(NumPoints, T, EndpointMode, &I0, &I1, &I2, &I3, &LocalT);
+    if (Err != HMM_SPLINE_OK)
+    {
+        return Err;
+    }
+
+    if (!HMM_SplinePointsValid(&Points[0].Elements[0], NumPoints * 2))
+    {
+        return HMM_SPLINE_ERR_NAN_POINT;
+    }
+
+    Out->X = HMM_BSplineF(Points[I0].X, Points[I1].X, Points[I2].X, Points[I3].X, LocalT);
+    Out->Y = HMM_BSplineF(Points[I0].Y, Points[I1].Y, Points[I2].Y, Points[I3].Y, LocalT);
+
+    return HMM_SPLINE_OK;
+}
+
+COVERAGE(HMM_BSplineV3, 1)
+static inline int HMM_BSplineV3(const HMM_Vec3 *Points, int NumPoints, float T, int EndpointMode, HMM_Vec3 *Out)
+{
+    ASSERT_COVERED(HMM_BSplineV3);
+
+    int I0, I1, I2, I3;
+    float LocalT;
+    int Err;
+
+    if (Points == 0 || Out == 0)
+    {
+        return HMM_SPLINE_ERR_NULL;
+    }
+
+    Err = HMM_SplineSegment(NumPoints, T, EndpointMode, &I0, &I1, &I2, &I3, &LocalT);
+    if (Err != HMM_SPLINE_OK)
+    {
+        return Err;
+    }
+
+    if (!HMM_SplinePointsValid(&Points[0].Elements[0], NumPoints * 3))
+    {
+        return HMM_SPLINE_ERR_NAN_POINT;
+    }
+
+    Out->X = HMM_BSplineF(Points[I0].X, Points[I1].X, Points[I2].X, Points[I3].X, LocalT);
+    Out->Y = HMM_BSplineF(Points[I0].Y, Points[I1].Y, Points[I2].Y, Points[I3].Y, LocalT);
+    Out->Z = HMM_BSplineF(Points[I0].Z, Points[I1].Z, Points[I2].Z, Points[I3].Z, LocalT);
+
+    return HMM_SPLINE_OK;
+}
+
+COVERAGE(HMM_BSplineV4, 1)
+static inline int HMM_BSplineV4(const HMM_Vec4 *Points, int NumPoints, float T, int EndpointMode, HMM_Vec4 *Out)
+{
+    ASSERT_COVERED(HMM_BSplineV4);
+
+    int I0, I1, I2, I3;
+    float LocalT;
+    int Err;
+
+    if (Points == 0 || Out == 0)
+    {
+        return HMM_SPLINE_ERR_NULL;
+    }
+
+    Err = HMM_SplineSegment(NumPoints, T, EndpointMode, &I0, &I1, &I2, &I3, &LocalT);
+    if (Err != HMM_SPLINE_OK)
+    {
+        return Err;
+    }
+
+    if (!HMM_SplinePointsValid(&Points[0].Elements[0], NumPoints * 4))
+    {
+        return HMM_SPLINE_ERR_NAN_POINT;
+    }
+
+    Out->X = HMM_BSplineF(Points[I0].X, Points[I1].X, Points[I2].X, Points[I3].X, LocalT);
+    Out->Y = HMM_BSplineF(Points[I0].Y, Points[I1].Y, Points[I2].Y, Points[I3].Y, LocalT);
+    Out->Z = HMM_BSplineF(Points[I0].Z, Points[I1].Z, Points[I2].Z, Points[I3].Z, LocalT);
+    Out->W = HMM_BSplineF(Points[I0].W, Points[I1].W, Points[I2].W, Points[I3].W, LocalT);
+
+    return HMM_SPLINE_OK;
+}
+
+/*
  * SSE stuff
  */
 
