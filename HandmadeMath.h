@@ -2400,6 +2400,142 @@ static inline HMM_Quat HMM_SLerp(HMM_Quat Left, float Time, HMM_Quat Right)
     return Result;
 }
 
+/*
+ * Skeletal-animation batch interpolation tools
+ *
+ * These helpers add validated, batch-oriented quaternion interpolation on
+ * top of the classic functions above. All of them report invalid input by
+ * returning 0 (false) instead of producing garbage:
+ *  - HMM_SLerpChecked:  spherical interpolation with shortest-path judgment
+ *  - HMM_SLerpBatch:    the same, applied to whole arrays in one call
+ *  - HMM_NormQChecked:  post-interpolation normalization with error check
+ */
+
+/* Non-zero if X is neither NaN nor +/-inf. Avoids <float.h> so that
+ * HANDMADE_MATH_PROVIDE_MATH_FUNCTIONS builds keep working. */
+static inline HMM_Bool _HMM_IsFiniteF(float X)
+{
+    return (X == X) && (X - X == 0.0f);
+}
+
+/* Non-zero if Q is finite and its length is within 0.0005 of 1. */
+static inline HMM_Bool _HMM_IsUnitQ(HMM_Quat Q)
+{
+    float LenSqr;
+
+    if (!_HMM_IsFiniteF(Q.X) || !_HMM_IsFiniteF(Q.Y) ||
+        !_HMM_IsFiniteF(Q.Z) || !_HMM_IsFiniteF(Q.W)) {
+        return 0;
+    }
+
+    LenSqr = HMM_DotQ(Q, Q);
+
+    return LenSqr > 0.999f && LenSqr < 1.001f;
+}
+
+/* Spherical interpolation between two unit quaternions, always taking the
+ * shortest path around the hyper-sphere. Returns 1 on success and stores
+ * the interpolated unit quaternion in Out. Returns 0 (and leaves Out
+ * untouched) if Out is NULL, Time is not finite or outside [0, 1], or
+ * either quaternion is not a finite unit quaternion.
+ *
+ * Degenerate endpoints are safe: identical quaternions (dot == 1) and
+ * opposite quaternions (dot == -1, i.e. the same rotation) both fall back
+ * to normalized linear interpolation and simply return the endpoint. */
+static inline HMM_Bool HMM_SLerpChecked(HMM_Quat Left, float Time, HMM_Quat Right, HMM_Quat *Out)
+{
+    HMM_Quat Result;
+    float Cos_Theta;
+
+    if (Out == 0) {
+        return 0;
+    }
+    if (!_HMM_IsFiniteF(Time) || Time < 0.0f || Time > 1.0f) {
+        return 0;
+    }
+    if (!_HMM_IsUnitQ(Left) || !_HMM_IsUnitQ(Right)) {
+        return 0;
+    }
+
+    Cos_Theta = HMM_DotQ(Left, Right);
+
+    if (Cos_Theta < 0.0f) { /* Take the shortest path on the hyper-sphere. */
+        Cos_Theta = -Cos_Theta;
+        Right = HMM_Q(-Right.X, -Right.Y, -Right.Z, -Right.W);
+    }
+
+    /* Use normalized linear interpolation when the quaternions are
+     * (nearly) linearly dependent, e.g. identical or opposite endpoints. */
+    if (Cos_Theta > 0.9995f) {
+        Result = HMM_NLerp(Left, Time, Right);
+    } else {
+        float Angle = HMM_ACosF(Cos_Theta);
+        float MixLeft = HMM_SinF((1.0f - Time) * Angle);
+        float MixRight = HMM_SinF(Time * Angle);
+
+        Result = _HMM_MixQ(Left, MixLeft, Right, MixRight);
+        Result = HMM_NormQ(Result);
+    }
+
+    *Out = Result;
+
+    return 1;
+}
+
+/* Batch spherical interpolation for skeletal animation: interpolates every
+ * (Left[I], Right[I]) pair at Time[I] into Out[I] in a single call.
+ * Returns 1 if all Count elements were interpolated. Returns 0 (and leaves
+ * the output array in an unspecified partially-written state) if any
+ * pointer is NULL, Count is negative, or any element fails validation. */
+static inline HMM_Bool HMM_SLerpBatch(HMM_Quat *Out, const HMM_Quat *Left, const float *Time, const HMM_Quat *Right, int Count)
+{
+    int I;
+
+    if (Out == 0 || Left == 0 || Time == 0 || Right == 0 || Count < 0) {
+        return 0;
+    }
+
+    for (I = 0; I < Count; ++I) {
+        if (!HMM_SLerpChecked(Left[I], Time[I], Right[I], &Out[I])) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+/* Normalizes Quat after interpolation and checks the normalization error.
+ * Stores the normalized quaternion in Out (if not NULL) and the deviation
+ * of the input length from 1 in OutDeviation (if not NULL). Returns 1 if
+ * the deviation is within Tolerance, 0 if it exceeds Tolerance or if Quat
+ * is non-finite or has (near-)zero length and cannot be normalized. */
+static inline HMM_Bool HMM_NormQChecked(HMM_Quat Quat, float Tolerance, HMM_Quat *Out, float *OutDeviation)
+{
+    float Len;
+    float Deviation;
+
+    if (!_HMM_IsFiniteF(Quat.X) || !_HMM_IsFiniteF(Quat.Y) ||
+        !_HMM_IsFiniteF(Quat.Z) || !_HMM_IsFiniteF(Quat.W)) {
+        return 0;
+    }
+
+    Len = HMM_SqrtF(HMM_DotQ(Quat, Quat));
+    if (Len < 1e-6f) {
+        return 0;
+    }
+
+    Deviation = HMM_ABS(Len - 1.0f);
+
+    if (Out != 0) {
+        *Out = HMM_NormQ(Quat);
+    }
+    if (OutDeviation != 0) {
+        *OutDeviation = Deviation;
+    }
+
+    return Deviation <= Tolerance;
+}
+
 COVERAGE(HMM_QToM4, 1)
 static inline HMM_Mat4 HMM_QToM4(HMM_Quat Left)
 {
