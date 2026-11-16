@@ -2657,6 +2657,303 @@ static inline HMM_Vec3 HMM_RotateV3AxisAngle_RH(HMM_Vec3 V, HMM_Vec3 Axis, float
 }
 
 
+/*
+ * Camera path sampling
+ *
+ * HMM_PathInit builds an arc-length parameterization of the uniform
+ * Catmull-Rom spline that passes through the given control points.
+ * HMM_SamplePath then walks the path at a fixed arc-length spacing,
+ * producing a position and a smoothed, tangent-derived orientation for
+ * each sample, so that a camera moves along the path at constant speed
+ * with smooth turning. Both the sample spacing and the orientation
+ * smoothing strength are configurable.
+ */
+
+#define HMM_PATH_MAX_POINTS 64
+#define HMM_PATH_TABLE_RESOLUTION 32 /* arc-length lookup substeps per spline segment */
+#define HMM_PATH_TABLE_SIZE ((HMM_PATH_MAX_POINTS - 1) * HMM_PATH_TABLE_RESOLUTION + 1)
+
+typedef struct HMM_PathSample
+{
+    HMM_Vec3 Position;
+    HMM_Quat Orientation;
+    float ArcLength;
+} HMM_PathSample;
+
+typedef struct HMM_PathSampler
+{
+    int NumPoints;
+    int TableCount;
+    float TotalLength;
+    HMM_Vec3 Points[HMM_PATH_MAX_POINTS];
+    float TableS[HMM_PATH_TABLE_SIZE]; /* cumulative arc length at u = i / HMM_PATH_TABLE_RESOLUTION */
+} HMM_PathSampler;
+
+/* Evaluates position and (unnormalized) tangent of the spline at spline
+   parameter U, where U is in units of segments: U in [0, NumPoints - 1].
+   Pos or Tan may be null. */
+static inline void _HMM_PathEval(const HMM_PathSampler *Path, float U, HMM_Vec3 *Pos, HMM_Vec3 *Tan)
+{
+    int Seg, I0, I1, I2, I3;
+    float T, T2, T3;
+    HMM_Vec3 P0, P1, P2, P3;
+    HMM_Vec3 C0, C1, C2, C3;
+
+    float MaxU = (float)(Path->NumPoints - 1);
+    if (U < 0.0f) {
+        U = 0.0f;
+    } else if (U > MaxU) {
+        U = MaxU;
+    }
+
+    Seg = (int)U;
+    if (Seg > Path->NumPoints - 2) {
+        Seg = Path->NumPoints - 2;
+    }
+    T = U - (float)Seg;
+    T2 = T * T;
+    T3 = T2 * T;
+
+    I0 = Seg - 1; if (I0 < 0) { I0 = 0; }
+    I1 = Seg;
+    I2 = Seg + 1;
+    I3 = Seg + 2; if (I3 > Path->NumPoints - 1) { I3 = Path->NumPoints - 1; }
+
+    P0 = Path->Points[I0];
+    P1 = Path->Points[I1];
+    P2 = Path->Points[I2];
+    P3 = Path->Points[I3];
+
+    /* Uniform Catmull-Rom basis:
+       pos(T) = 0.5 * (C0 + C1*T + C2*T^2 + C3*T^3)
+       tan(T) = 0.5 * (C1 + 2*C2*T + 3*C3*T^2) */
+    C0 = HMM_MulV3F(P1, 2.0f);
+    C1 = HMM_SubV3(P2, P0);
+    C2 = HMM_AddV3(HMM_SubV3(HMM_MulV3F(P0, 2.0f), HMM_MulV3F(P1, 5.0f)),
+                   HMM_SubV3(HMM_MulV3F(P2, 4.0f), P3));
+    C3 = HMM_AddV3(HMM_SubV3(HMM_MulV3F(P1, 3.0f), P0),
+                   HMM_SubV3(P3, HMM_MulV3F(P2, 3.0f)));
+
+    if (Pos) {
+        HMM_Vec3 R = HMM_AddV3(C0,
+                     HMM_AddV3(HMM_MulV3F(C1, T),
+                     HMM_AddV3(HMM_MulV3F(C2, T2),
+                               HMM_MulV3F(C3, T3))));
+        *Pos = HMM_MulV3F(R, 0.5f);
+    }
+
+    if (Tan) {
+        HMM_Vec3 R = HMM_AddV3(C1,
+                     HMM_AddV3(HMM_MulV3F(C2, 2.0f * T),
+                               HMM_MulV3F(C3, 3.0f * T2)));
+        *Tan = HMM_MulV3F(R, 0.5f);
+    }
+}
+
+/* Maps an arc length to the spline parameter U via the lookup table. */
+static inline float _HMM_PathUAtLength(const HMM_PathSampler *Path, float S)
+{
+    int Lo, Hi;
+    float SegLen, F;
+
+    if (S <= 0.0f) {
+        return 0.0f;
+    }
+    if (S >= Path->TotalLength) {
+        return (float)(Path->NumPoints - 1);
+    }
+
+    Lo = 0;
+    Hi = Path->TableCount - 1;
+    while (Hi - Lo > 1) {
+        int Mid = (Lo + Hi) / 2;
+        if (Path->TableS[Mid] <= S) {
+            Lo = Mid;
+        } else {
+            Hi = Mid;
+        }
+    }
+
+    SegLen = Path->TableS[Hi] - Path->TableS[Lo];
+    F = (SegLen > 0.0f) ? (S - Path->TableS[Lo]) / SegLen : 0.0f;
+
+    return ((float)Lo + F) / (float)HMM_PATH_TABLE_RESOLUTION;
+}
+
+/* Builds a quaternion whose forward (+Z) axis points along the tangent. */
+static inline HMM_Quat _HMM_PathQuatFromTangent(HMM_Vec3 Tangent, HMM_Vec3 Up)
+{
+    HMM_Quat Q;
+    HMM_Vec3 F, R, U;
+    float Trace, S;
+
+    F = HMM_NormV3(Tangent);
+    R = HMM_Cross(Up, F);
+    if (HMM_DotV3(R, R) < 1e-8f) {
+        /* Tangent nearly parallel to Up: pick a different reference axis. */
+        Up = HMM_V3(0.0f, 0.0f, 1.0f);
+        R = HMM_Cross(Up, F);
+        if (HMM_DotV3(R, R) < 1e-8f) {
+            Up = HMM_V3(1.0f, 0.0f, 0.0f);
+            R = HMM_Cross(Up, F);
+        }
+    }
+    R = HMM_NormV3(R);
+    U = HMM_Cross(F, R);
+
+    /* Rotation matrix with columns R, U, F -> quaternion (Shepperd's method). */
+    Trace = R.X + U.Y + F.Z;
+    if (Trace > 0.0f) {
+        S = HMM_SqrtF(Trace + 1.0f) * 2.0f;
+        Q.W = 0.25f * S;
+        Q.X = (U.Z - F.Y) / S;
+        Q.Y = (F.X - R.Z) / S;
+        Q.Z = (R.Y - U.X) / S;
+    } else if (R.X > U.Y && R.X > F.Z) {
+        S = HMM_SqrtF(1.0f + R.X - U.Y - F.Z) * 2.0f;
+        Q.W = (U.Z - F.Y) / S;
+        Q.X = 0.25f * S;
+        Q.Y = (U.X + R.Y) / S;
+        Q.Z = (F.X + R.Z) / S;
+    } else if (U.Y > F.Z) {
+        S = HMM_SqrtF(1.0f + U.Y - R.X - F.Z) * 2.0f;
+        Q.W = (F.X - R.Z) / S;
+        Q.X = (U.X + R.Y) / S;
+        Q.Y = 0.25f * S;
+        Q.Z = (F.Y + U.Z) / S;
+    } else {
+        S = HMM_SqrtF(1.0f + F.Z - R.X - U.Y) * 2.0f;
+        Q.W = (R.Y - U.X) / S;
+        Q.X = (F.X + R.Z) / S;
+        Q.Y = (F.Y + U.Z) / S;
+        Q.Z = 0.25f * S;
+    }
+
+    return HMM_NormQ(Q);
+}
+
+/* Initializes a path sampler from control points. Returns 1 on success,
+   0 on error (null arguments, fewer than 2 or more than
+   HMM_PATH_MAX_POINTS control points, or a zero-length path). */
+static inline int HMM_PathInit(HMM_PathSampler *Path, const HMM_Vec3 *ControlPoints, int NumControlPoints)
+{
+    int I;
+    int Segments;
+    float Cumulative;
+    HMM_Vec3 Prev, Cur, Tan;
+
+    if (Path == 0 || ControlPoints == 0) {
+        return 0;
+    }
+    if (NumControlPoints < 2 || NumControlPoints > HMM_PATH_MAX_POINTS) {
+        return 0;
+    }
+
+    Path->NumPoints = NumControlPoints;
+    for (I = 0; I < NumControlPoints; ++I) {
+        Path->Points[I] = ControlPoints[I];
+    }
+
+    Segments = NumControlPoints - 1;
+    Path->TableCount = Segments * HMM_PATH_TABLE_RESOLUTION + 1;
+
+    Cumulative = 0.0f;
+    _HMM_PathEval(Path, 0.0f, &Prev, &Tan);
+    Path->TableS[0] = 0.0f;
+    for (I = 1; I < Path->TableCount; ++I) {
+        _HMM_PathEval(Path, (float)I / (float)HMM_PATH_TABLE_RESOLUTION, &Cur, &Tan);
+        Cumulative += HMM_LenV3(HMM_SubV3(Cur, Prev));
+        Path->TableS[I] = Cumulative;
+        Prev = Cur;
+    }
+
+    if (!(Cumulative > 0.0f)) {
+        return 0; /* degenerate path: all control points coincident */
+    }
+
+    Path->TotalLength = Cumulative;
+    return 1;
+}
+
+/* Returns the total arc length of the path. */
+static inline float HMM_PathLength(const HMM_PathSampler *Path)
+{
+    return (Path != 0) ? Path->TotalLength : 0.0f;
+}
+
+/* Samples the path at a fixed arc-length spacing. Smoothing controls the
+   orientation smoothing strength: 0 disables smoothing (raw tangent
+   orientation), values closer to 1 smooth more aggressively. Writes up to
+   MaxSamples samples and returns the sample count, or a negative value on
+   error (null arguments, MaxSamples < 1, non-positive or NaN Spacing, or
+   Smoothing outside [0, 1)). */
+static inline int HMM_SamplePath(const HMM_PathSampler *Path, float Spacing, float Smoothing, HMM_PathSample *OutSamples, int MaxSamples)
+{
+    int Count;
+    float S, Blend;
+    HMM_Vec3 Up;
+    HMM_Quat PrevQ, PrevRaw;
+
+    if (Path == 0 || OutSamples == 0 || MaxSamples < 1) {
+        return -1;
+    }
+    if (!(Spacing > 0.0f)) {
+        return -1; /* illegal spacing: zero, negative, or NaN */
+    }
+    if (!(Smoothing >= 0.0f && Smoothing < 1.0f)) {
+        return -1;
+    }
+
+    Count = 0;
+    Blend = 1.0f - Smoothing;
+    Up = HMM_V3(0.0f, 1.0f, 0.0f);
+    PrevQ = HMM_Q(0.0f, 0.0f, 0.0f, 1.0f);
+    PrevRaw = PrevQ;
+
+    S = 0.0f;
+    for (;;) {
+        float U = _HMM_PathUAtLength(Path, S);
+        HMM_Vec3 Pos, Tan;
+        HMM_Quat Raw, Q;
+
+        _HMM_PathEval(Path, U, &Pos, &Tan);
+        if (HMM_DotV3(Tan, Tan) > 1e-12f) {
+            Raw = _HMM_PathQuatFromTangent(Tan, Up);
+        } else {
+            Raw = PrevRaw; /* degenerate tangent: keep previous orientation */
+        }
+
+        Q = (Count > 0) ? HMM_NormQ(HMM_SLerp(PrevQ, Blend, Raw)) : Raw;
+
+        OutSamples[Count].Position = Pos;
+        OutSamples[Count].Orientation = Q;
+        OutSamples[Count].ArcLength = S;
+        ++Count;
+
+        PrevQ = Q;
+        PrevRaw = Raw;
+
+        if (Count >= MaxSamples) {
+            break;
+        }
+
+        S += Spacing;
+        if (S > Path->TotalLength) {
+            /* Always land exactly on the end of the path, unless the
+               previous sample is already (numerically) there. */
+            float Remainder = Path->TotalLength - OutSamples[Count - 1].ArcLength;
+            if (Remainder > 1e-4f) {
+                S = Path->TotalLength;
+            } else {
+                break;
+            }
+        }
+    }
+
+    return Count;
+}
+
+
 #ifdef __cplusplus
 }
 #endif
