@@ -437,6 +437,229 @@ typedef union HMM_Quat
 typedef signed int HMM_Bool;
 
 /*
+ * Numeric diagnostics (opt-in)
+ *
+ * When HANDMADE_MATH_DIAGNOSTICS is defined before including this header, every
+ * checked function validates its own result on exit and records a diagnostic
+ * event if the result is NaN or infinite. When it is not defined, the whole
+ * subsystem compiles to nothing and the library is bit-for-bit the same.
+ *
+ *   #define HANDMADE_MATH_DIAGNOSTICS
+ *   #define HANDMADE_MATH_DIAGNOSTICS_CAPACITY 32 // optional, default 32
+ *   #include "HandmadeMath.h"
+ *
+ * All diagnostics are process-wide and are NOT thread-safe; query and clear
+ * them from one thread only. HMM_DiagRecord is always declared, so buffers can
+ * be declared unconditionally in code that is also built without diagnostics.
+ *
+ *   HMM_DiagRecord Records[32];
+ *   int Count = HMM_DiagGetRecords(Records, 32); // copy out, oldest first
+ *   int Held  = HMM_DiagGetCount();              // events currently held
+ *   HMM_DiagCounter Dropped = HMM_DiagGetDropped(); // events lost to capacity
+ *   HMM_DiagSetEnabled(0); // instrumented build: turn checking off
+ *   HMM_DiagClear();
+ */
+
+/* 64-bit where the language supports it; C++98 pedantic does not know long long. */
+#if defined(__cplusplus) && __cplusplus < 201103L
+typedef unsigned long HMM_DiagCounter;
+#else
+typedef unsigned long long HMM_DiagCounter;
+#endif
+
+#ifdef HANDMADE_MATH_DIAGNOSTICS
+
+# ifndef HANDMADE_MATH_DIAGNOSTICS_CAPACITY
+#  define HANDMADE_MATH_DIAGNOSTICS_CAPACITY 32
+# endif
+
+# if HANDMADE_MATH_DIAGNOSTICS_CAPACITY < 1
+#  error "HANDMADE_MATH_DIAGNOSTICS_CAPACITY must be at least 1"
+# endif
+
+typedef struct HMM_DiagRecord
+{
+    const char *Function;      /* function whose result was bad */
+    float Value;               /* offending component */
+    unsigned int Index;        /* component index in the result, else 0 */
+    unsigned char IsNaN;       /* 1 = NaN, 0 = infinity */
+    HMM_DiagCounter Sequence;  /* monotonically increasing event id */
+} HMM_DiagRecord;
+
+/* Instrumented builds check and record by default. */
+static int HMM_DiagEnabled_ = 1;
+static unsigned int HMM_DiagCount_ = 0;
+static unsigned int HMM_DiagHead_ = 0; /* next slot to overwrite once full */
+static HMM_DiagCounter HMM_DiagNextSeq_ = 0;
+static HMM_DiagCounter HMM_DiagDropped_ = 0;
+static HMM_DiagRecord HMM_DiagRing_[HANDMADE_MATH_DIAGNOSTICS_CAPACITY];
+
+/* NaN is the only value unequal to itself. Infinity is a value that is neither
+   NaN nor within the finite float range. Neither check needs <math.h>, so this
+   still works with HANDMADE_MATH_PROVIDE_MATH_FUNCTIONS. FLT_MAX is spelled out
+   to avoid requiring <float.h>; the value is exactly 0x1.fffffep+127. */
+#define HMM_DIAG_FLOAT_MAX 3.4028234663852886e+38F
+
+static inline int HMM_DiagIsNaN(float Value)
+{
+    return Value != Value;
+}
+
+static inline int HMM_DiagIsInf(float Value)
+{
+    return !HMM_DiagIsNaN(Value)
+        && (Value > HMM_DIAG_FLOAT_MAX || Value < -HMM_DIAG_FLOAT_MAX);
+}
+
+static inline int HMM_DiagIsBad(float Value)
+{
+    return HMM_DiagIsNaN(Value) || HMM_DiagIsInf(Value);
+}
+
+static inline int HMM_DiagGetEnabled(void)
+{
+    return HMM_DiagEnabled_;
+}
+
+static inline void HMM_DiagSetEnabled(int Enabled)
+{
+    HMM_DiagEnabled_ = Enabled ? 1 : 0;
+}
+
+static inline HMM_DiagCounter HMM_DiagGetDropped(void)
+{
+    return HMM_DiagDropped_;
+}
+
+/* Number of events currently in the ring (never more than the capacity). */
+static inline int HMM_DiagGetCount(void)
+{
+    return (int)HMM_DiagCount_;
+}
+
+static inline void HMM_DiagClear(void)
+{
+    HMM_DiagCount_ = 0;
+    HMM_DiagHead_ = 0;
+    HMM_DiagNextSeq_ = 0;
+    HMM_DiagDropped_ = 0;
+}
+
+/* Copies up to MaxRecords of the recorded events, oldest first. Records may be
+   NULL when MaxRecords is 0, which just reports the count. Returns the number
+   copied, which never exceeds both MaxRecords and the configured capacity.
+   When MaxRecords is smaller than the number of live events the newest ones are
+   kept, matching the ring's "drop oldest" behaviour. */
+static inline int HMM_DiagGetRecords(HMM_DiagRecord *Records, int MaxRecords)
+{
+    unsigned int Take;
+    unsigned int First;
+    unsigned int i;
+
+    if (MaxRecords < 0)
+    {
+        MaxRecords = 0;
+    }
+
+    /* HMM_DiagCount_ is already capped at the capacity by HMM_DiagRecord_, and
+       it is the number of live events in both the filled and unfilled cases. */
+    Take = HMM_DiagCount_;
+    if ((unsigned int)MaxRecords < Take)
+    {
+        Take = (unsigned int)MaxRecords;
+    }
+
+    /* Newest event is at head-1 once the ring has wrapped, otherwise at
+       count-1; either way the oldest of the Take newest is count-Take back. */
+    First = (HMM_DiagHead_ + HMM_DiagCount_ + HANDMADE_MATH_DIAGNOSTICS_CAPACITY - Take)
+            % HANDMADE_MATH_DIAGNOSTICS_CAPACITY;
+
+    for (i = 0; i < Take; ++i)
+    {
+        if (Records)
+        {
+            Records[i] = HMM_DiagRing_[(First + i) % HANDMADE_MATH_DIAGNOSTICS_CAPACITY];
+        }
+    }
+
+    return (int)Take;
+}
+
+/* Records one event. Called on the exit path of every checked function. */
+static inline void HMM_DiagRecord_(const char *Function, float Value, unsigned int Index)
+{
+    HMM_DiagRecord *Slot;
+
+    if (HMM_DiagCount_ < HANDMADE_MATH_DIAGNOSTICS_CAPACITY)
+    {
+        Slot = &HMM_DiagRing_[(HMM_DiagHead_ + HMM_DiagCount_)
+                              % HANDMADE_MATH_DIAGNOSTICS_CAPACITY];
+        ++HMM_DiagCount_;
+    }
+    else
+    {
+        /* Ring is full: overwrite the oldest event. */
+        Slot = &HMM_DiagRing_[HMM_DiagHead_];
+        HMM_DiagHead_ = (HMM_DiagHead_ + 1) % HANDMADE_MATH_DIAGNOSTICS_CAPACITY;
+        ++HMM_DiagDropped_;
+    }
+
+    Slot->Function = Function;
+    Slot->Value = Value;
+    Slot->Index = Index;
+    Slot->IsNaN = (unsigned char)HMM_DiagIsNaN(Value);
+    Slot->Sequence = HMM_DiagNextSeq_++;
+}
+
+/* Scalar result check, used from the exit path itself. */
+static inline void HMM_DiagCheckF_(const char *Function, float Value)
+{
+    if (HMM_DiagIsBad(Value))
+    {
+        HMM_DiagRecord_(Function, Value, 0);
+    }
+}
+
+/* Vector / matrix result check: the first bad component is reported. */
+static inline void HMM_DiagCheckVec_(const char *Function, const float *Values, unsigned int Count)
+{
+    unsigned int i;
+    for (i = 0; i < Count; ++i)
+    {
+        if (HMM_DiagIsBad(Values[i]))
+        {
+            HMM_DiagRecord_(Function, Values[i], i);
+            return;
+        }
+    }
+}
+
+/* Exit-path hooks used to annotate the checked functions. Outside instrumented
+   builds they expand to nothing, so the public functions are unchanged. */
+# define HMM_DIAG_CHECK_F(Function, Value) \
+    do { if (HMM_DiagEnabled_) { HMM_DiagCheckF_((Function), (Value)); } } while (0)
+
+# define HMM_DIAG_CHECK_V(Function, Values, Count) \
+    do { if (HMM_DiagEnabled_) { HMM_DiagCheckVec_((Function), (Values), (Count)); } } while (0)
+
+#else
+
+/* The record type stays visible so callers can declare buffers unconditionally. */
+typedef struct HMM_DiagRecord
+{
+    const char *Function;
+    float Value;
+    unsigned int Index;
+    unsigned char IsNaN;
+    HMM_DiagCounter Sequence;
+} HMM_DiagRecord;
+
+# define HMM_DIAG_CHECK_F(Function, Value) ((void)0)
+# define HMM_DIAG_CHECK_V(Function, Values, Count) ((void)0)
+
+#endif /* HANDMADE_MATH_DIAGNOSTICS */
+
+/*
  * Angle unit conversion functions
  */
 static inline float HMM_ToRad(float Angle)
@@ -486,6 +709,7 @@ COVERAGE(HMM_SinF, 1)
 static inline float HMM_SinF(float Angle)
 {
     ASSERT_COVERED(HMM_SinF);
+    HMM_DIAG_CHECK_F("HMM_SinF", HMM_SINF(HMM_ANGLE_USER_TO_INTERNAL(Angle)));
     return HMM_SINF(HMM_ANGLE_USER_TO_INTERNAL(Angle));
 }
 
@@ -493,6 +717,7 @@ COVERAGE(HMM_CosF, 1)
 static inline float HMM_CosF(float Angle)
 {
     ASSERT_COVERED(HMM_CosF);
+    HMM_DIAG_CHECK_F("HMM_CosF", HMM_COSF(HMM_ANGLE_USER_TO_INTERNAL(Angle)));
     return HMM_COSF(HMM_ANGLE_USER_TO_INTERNAL(Angle));
 }
 
@@ -500,6 +725,7 @@ COVERAGE(HMM_TanF, 1)
 static inline float HMM_TanF(float Angle)
 {
     ASSERT_COVERED(HMM_TanF);
+    HMM_DIAG_CHECK_F("HMM_TanF", HMM_TANF(HMM_ANGLE_USER_TO_INTERNAL(Angle)));
     return HMM_TANF(HMM_ANGLE_USER_TO_INTERNAL(Angle));
 }
 
@@ -507,6 +733,7 @@ COVERAGE(HMM_ACosF, 1)
 static inline float HMM_ACosF(float Arg)
 {
     ASSERT_COVERED(HMM_ACosF);
+    HMM_DIAG_CHECK_F("HMM_ACosF", HMM_ANGLE_INTERNAL_TO_USER(HMM_ACOSF(Arg)));
     return HMM_ANGLE_INTERNAL_TO_USER(HMM_ACOSF(Arg));
 }
 
@@ -529,6 +756,7 @@ static inline float HMM_SqrtF(float Float)
     Result = HMM_SQRTF(Float);
 #endif
 
+    HMM_DIAG_CHECK_F("HMM_SqrtF", Result);
     return Result;
 }
 
@@ -541,6 +769,7 @@ static inline float HMM_InvSqrtF(float Float)
 
     Result = 1.0f/HMM_SqrtF(Float);
 
+    HMM_DIAG_CHECK_F("HMM_InvSqrtF", Result);
     return Result;
 }
 
@@ -553,6 +782,7 @@ COVERAGE(HMM_Lerp, 1)
 static inline float HMM_Lerp(float A, float Time, float B)
 {
     ASSERT_COVERED(HMM_Lerp);
+    HMM_DIAG_CHECK_F("HMM_Lerp", (1.0f - Time) * A + Time * B);
     return (1.0f - Time) * A + Time * B;
 }
 
@@ -573,6 +803,7 @@ static inline float HMM_Clamp(float Min, float Value, float Max)
         Result = Max;
     }
 
+    HMM_DIAG_CHECK_F("HMM_Clamp", Result);
     return Result;
 }
 
@@ -662,6 +893,7 @@ static inline HMM_Vec2 HMM_AddV2(HMM_Vec2 Left, HMM_Vec2 Right)
     Result.X = Left.X + Right.X;
     Result.Y = Left.Y + Right.Y;
 
+    HMM_DIAG_CHECK_V("HMM_AddV2", &Result.X, 2);
     return Result;
 }
 
@@ -675,6 +907,7 @@ static inline HMM_Vec3 HMM_AddV3(HMM_Vec3 Left, HMM_Vec3 Right)
     Result.Y = Left.Y + Right.Y;
     Result.Z = Left.Z + Right.Z;
 
+    HMM_DIAG_CHECK_V("HMM_AddV3", &Result.X, 3);
     return Result;
 }
 
@@ -696,6 +929,7 @@ static inline HMM_Vec4 HMM_AddV4(HMM_Vec4 Left, HMM_Vec4 Right)
     Result.W = Left.W + Right.W;
 #endif
 
+    HMM_DIAG_CHECK_V("HMM_AddV4", &Result.X, 4);
     return Result;
 }
 
@@ -708,6 +942,7 @@ static inline HMM_Vec2 HMM_SubV2(HMM_Vec2 Left, HMM_Vec2 Right)
     Result.X = Left.X - Right.X;
     Result.Y = Left.Y - Right.Y;
 
+    HMM_DIAG_CHECK_V("HMM_SubV2", &Result.X, 2);
     return Result;
 }
 
@@ -721,6 +956,7 @@ static inline HMM_Vec3 HMM_SubV3(HMM_Vec3 Left, HMM_Vec3 Right)
     Result.Y = Left.Y - Right.Y;
     Result.Z = Left.Z - Right.Z;
 
+    HMM_DIAG_CHECK_V("HMM_SubV3", &Result.X, 3);
     return Result;
 }
 
@@ -742,6 +978,7 @@ static inline HMM_Vec4 HMM_SubV4(HMM_Vec4 Left, HMM_Vec4 Right)
     Result.W = Left.W - Right.W;
 #endif
 
+    HMM_DIAG_CHECK_V("HMM_SubV4", &Result.X, 4);
     return Result;
 }
 
@@ -754,6 +991,7 @@ static inline HMM_Vec2 HMM_MulV2(HMM_Vec2 Left, HMM_Vec2 Right)
     Result.X = Left.X * Right.X;
     Result.Y = Left.Y * Right.Y;
 
+    HMM_DIAG_CHECK_V("HMM_MulV2", &Result.X, 2);
     return Result;
 }
 
@@ -766,6 +1004,7 @@ static inline HMM_Vec2 HMM_MulV2F(HMM_Vec2 Left, float Right)
     Result.X = Left.X * Right;
     Result.Y = Left.Y * Right;
 
+    HMM_DIAG_CHECK_V("HMM_MulV2F", &Result.X, 2);
     return Result;
 }
 
@@ -779,6 +1018,7 @@ static inline HMM_Vec3 HMM_MulV3(HMM_Vec3 Left, HMM_Vec3 Right)
     Result.Y = Left.Y * Right.Y;
     Result.Z = Left.Z * Right.Z;
 
+    HMM_DIAG_CHECK_V("HMM_MulV3", &Result.X, 3);
     return Result;
 }
 
@@ -792,6 +1032,7 @@ static inline HMM_Vec3 HMM_MulV3F(HMM_Vec3 Left, float Right)
     Result.Y = Left.Y * Right;
     Result.Z = Left.Z * Right;
 
+    HMM_DIAG_CHECK_V("HMM_MulV3F", &Result.X, 3);
     return Result;
 }
 
@@ -813,6 +1054,7 @@ static inline HMM_Vec4 HMM_MulV4(HMM_Vec4 Left, HMM_Vec4 Right)
     Result.W = Left.W * Right.W;
 #endif
 
+    HMM_DIAG_CHECK_V("HMM_MulV4", &Result.X, 4);
     return Result;
 }
 
@@ -835,6 +1077,7 @@ static inline HMM_Vec4 HMM_MulV4F(HMM_Vec4 Left, float Right)
     Result.W = Left.W * Right;
 #endif
 
+    HMM_DIAG_CHECK_V("HMM_MulV4F", &Result.X, 4);
     return Result;
 }
 
@@ -847,6 +1090,7 @@ static inline HMM_Vec2 HMM_DivV2(HMM_Vec2 Left, HMM_Vec2 Right)
     Result.X = Left.X / Right.X;
     Result.Y = Left.Y / Right.Y;
 
+    HMM_DIAG_CHECK_V("HMM_DivV2", &Result.X, 2);
     return Result;
 }
 
@@ -859,6 +1103,7 @@ static inline HMM_Vec2 HMM_DivV2F(HMM_Vec2 Left, float Right)
     Result.X = Left.X / Right;
     Result.Y = Left.Y / Right;
 
+    HMM_DIAG_CHECK_V("HMM_DivV2F", &Result.X, 2);
     return Result;
 }
 
@@ -872,6 +1117,7 @@ static inline HMM_Vec3 HMM_DivV3(HMM_Vec3 Left, HMM_Vec3 Right)
     Result.Y = Left.Y / Right.Y;
     Result.Z = Left.Z / Right.Z;
 
+    HMM_DIAG_CHECK_V("HMM_DivV3", &Result.X, 3);
     return Result;
 }
 
@@ -885,6 +1131,7 @@ static inline HMM_Vec3 HMM_DivV3F(HMM_Vec3 Left, float Right)
     Result.Y = Left.Y / Right;
     Result.Z = Left.Z / Right;
 
+    HMM_DIAG_CHECK_V("HMM_DivV3F", &Result.X, 3);
     return Result;
 }
 
@@ -906,6 +1153,7 @@ static inline HMM_Vec4 HMM_DivV4(HMM_Vec4 Left, HMM_Vec4 Right)
     Result.W = Left.W / Right.W;
 #endif
 
+    HMM_DIAG_CHECK_V("HMM_DivV4", &Result.X, 4);
     return Result;
 }
 
@@ -929,6 +1177,7 @@ static inline HMM_Vec4 HMM_DivV4F(HMM_Vec4 Left, float Right)
     Result.W = Left.W / Right;
 #endif
 
+    HMM_DIAG_CHECK_V("HMM_DivV4F", &Result.X, 4);
     return Result;
 }
 
@@ -957,6 +1206,7 @@ COVERAGE(HMM_DotV2, 1)
 static inline float HMM_DotV2(HMM_Vec2 Left, HMM_Vec2 Right)
 {
     ASSERT_COVERED(HMM_DotV2);
+    HMM_DIAG_CHECK_F("HMM_DotV2", (Left.X * Right.X) + (Left.Y * Right.Y));
     return (Left.X * Right.X) + (Left.Y * Right.Y);
 }
 
@@ -964,6 +1214,7 @@ COVERAGE(HMM_DotV3, 1)
 static inline float HMM_DotV3(HMM_Vec3 Left, HMM_Vec3 Right)
 {
     ASSERT_COVERED(HMM_DotV3);
+    HMM_DIAG_CHECK_F("HMM_DotV3", (Left.X * Right.X) + (Left.Y * Right.Y) + (Left.Z * Right.Z));
     return (Left.X * Right.X) + (Left.Y * Right.Y) + (Left.Z * Right.Z);
 }
 
@@ -993,6 +1244,7 @@ static inline float HMM_DotV4(HMM_Vec4 Left, HMM_Vec4 Right)
     Result = ((Left.X * Right.X) + (Left.Z * Right.Z)) + ((Left.Y * Right.Y) + (Left.W * Right.W));
 #endif
 
+    HMM_DIAG_CHECK_F("HMM_DotV4", Result);
     return Result;
 }
 
@@ -1006,6 +1258,7 @@ static inline HMM_Vec3 HMM_Cross(HMM_Vec3 Left, HMM_Vec3 Right)
     Result.Y = (Left.Z * Right.X) - (Left.X * Right.Z);
     Result.Z = (Left.X * Right.Y) - (Left.Y * Right.X);
 
+    HMM_DIAG_CHECK_V("HMM_Cross", &Result.X, 3);
     return Result;
 }
 
@@ -1018,63 +1271,81 @@ COVERAGE(HMM_LenSqrV2, 1)
 static inline float HMM_LenSqrV2(HMM_Vec2 A)
 {
     ASSERT_COVERED(HMM_LenSqrV2);
-    return HMM_DotV2(A, A);
+    float Result = HMM_DotV2(A, A);
+    HMM_DIAG_CHECK_F("HMM_LenSqrV2", Result);
+    return Result;
 }
 
 COVERAGE(HMM_LenSqrV3, 1)
 static inline float HMM_LenSqrV3(HMM_Vec3 A)
 {
     ASSERT_COVERED(HMM_LenSqrV3);
-    return HMM_DotV3(A, A);
+    float Result = HMM_DotV3(A, A);
+    HMM_DIAG_CHECK_F("HMM_LenSqrV3", Result);
+    return Result;
 }
 
 COVERAGE(HMM_LenSqrV4, 1)
 static inline float HMM_LenSqrV4(HMM_Vec4 A)
 {
     ASSERT_COVERED(HMM_LenSqrV4);
-    return HMM_DotV4(A, A);
+    float Result = HMM_DotV4(A, A);
+    HMM_DIAG_CHECK_F("HMM_LenSqrV4", Result);
+    return Result;
 }
 
 COVERAGE(HMM_LenV2, 1)
 static inline float HMM_LenV2(HMM_Vec2 A)
 {
     ASSERT_COVERED(HMM_LenV2);
-    return HMM_SqrtF(HMM_LenSqrV2(A));
+    float Result = HMM_SqrtF(HMM_LenSqrV2(A));
+    HMM_DIAG_CHECK_F("HMM_LenV2", Result);
+    return Result;
 }
 
 COVERAGE(HMM_LenV3, 1)
 static inline float HMM_LenV3(HMM_Vec3 A)
 {
     ASSERT_COVERED(HMM_LenV3);
-    return HMM_SqrtF(HMM_LenSqrV3(A));
+    float Result = HMM_SqrtF(HMM_LenSqrV3(A));
+    HMM_DIAG_CHECK_F("HMM_LenV3", Result);
+    return Result;
 }
 
 COVERAGE(HMM_LenV4, 1)
 static inline float HMM_LenV4(HMM_Vec4 A)
 {
     ASSERT_COVERED(HMM_LenV4);
-    return HMM_SqrtF(HMM_LenSqrV4(A));
+    float Result = HMM_SqrtF(HMM_LenSqrV4(A));
+    HMM_DIAG_CHECK_F("HMM_LenV4", Result);
+    return Result;
 }
 
 COVERAGE(HMM_NormV2, 1)
 static inline HMM_Vec2 HMM_NormV2(HMM_Vec2 A)
 {
     ASSERT_COVERED(HMM_NormV2);
-    return HMM_MulV2F(A, HMM_InvSqrtF(HMM_DotV2(A, A)));
+    HMM_Vec2 Result = HMM_MulV2F(A, HMM_InvSqrtF(HMM_DotV2(A, A)));
+    HMM_DIAG_CHECK_V("HMM_NormV2", &Result.X, 2);
+    return Result;
 }
 
 COVERAGE(HMM_NormV3, 1)
 static inline HMM_Vec3 HMM_NormV3(HMM_Vec3 A)
 {
     ASSERT_COVERED(HMM_NormV3);
-    return HMM_MulV3F(A, HMM_InvSqrtF(HMM_DotV3(A, A)));
+    HMM_Vec3 Result = HMM_MulV3F(A, HMM_InvSqrtF(HMM_DotV3(A, A)));
+    HMM_DIAG_CHECK_V("HMM_NormV3", &Result.X, 3);
+    return Result;
 }
 
 COVERAGE(HMM_NormV4, 1)
 static inline HMM_Vec4 HMM_NormV4(HMM_Vec4 A)
 {
     ASSERT_COVERED(HMM_NormV4);
-    return HMM_MulV4F(A, HMM_InvSqrtF(HMM_DotV4(A, A)));
+    HMM_Vec4 Result = HMM_MulV4F(A, HMM_InvSqrtF(HMM_DotV4(A, A)));
+    HMM_DIAG_CHECK_V("HMM_NormV4", &Result.X, 4);
+    return Result;
 }
 
 /*
@@ -1085,21 +1356,27 @@ COVERAGE(HMM_LerpV2, 1)
 static inline HMM_Vec2 HMM_LerpV2(HMM_Vec2 A, float Time, HMM_Vec2 B)
 {
     ASSERT_COVERED(HMM_LerpV2);
-    return HMM_AddV2(HMM_MulV2F(A, 1.0f - Time), HMM_MulV2F(B, Time));
+    HMM_Vec2 Result = HMM_AddV2(HMM_MulV2F(A, 1.0f - Time), HMM_MulV2F(B, Time));
+    HMM_DIAG_CHECK_V("HMM_LerpV2", &Result.X, 2);
+    return Result;
 }
 
 COVERAGE(HMM_LerpV3, 1)
 static inline HMM_Vec3 HMM_LerpV3(HMM_Vec3 A, float Time, HMM_Vec3 B)
 {
     ASSERT_COVERED(HMM_LerpV3);
-    return HMM_AddV3(HMM_MulV3F(A, 1.0f - Time), HMM_MulV3F(B, Time));
+    HMM_Vec3 Result = HMM_AddV3(HMM_MulV3F(A, 1.0f - Time), HMM_MulV3F(B, Time));
+    HMM_DIAG_CHECK_V("HMM_LerpV3", &Result.X, 3);
+    return Result;
 }
 
 COVERAGE(HMM_LerpV4, 1)
 static inline HMM_Vec4 HMM_LerpV4(HMM_Vec4 A, float Time, HMM_Vec4 B)
 {
     ASSERT_COVERED(HMM_LerpV4);
-    return HMM_AddV4(HMM_MulV4F(A, 1.0f - Time), HMM_MulV4F(B, Time));
+    HMM_Vec4 Result = HMM_AddV4(HMM_MulV4F(A, 1.0f - Time), HMM_MulV4F(B, Time));
+    HMM_DIAG_CHECK_V("HMM_LerpV4", &Result.X, 4);
+    return Result;
 }
 
 /*
@@ -1144,6 +1421,7 @@ static inline HMM_Vec4 HMM_LinearCombineV4M4(HMM_Vec4 Left, HMM_Mat4 Right)
     Result.W += Left.Elements[3] * Right.Columns[3].W;
 #endif
 
+    HMM_DIAG_CHECK_V("HMM_LinearCombineV4M4", &Result.X, 4);
     return Result;
 }
 
@@ -1181,6 +1459,7 @@ static inline HMM_Mat2 HMM_TransposeM2(HMM_Mat2 Matrix)
     Result.Elements[0][1] = Matrix.Elements[1][0];
     Result.Elements[1][0] = Matrix.Elements[0][1];
 
+    HMM_DIAG_CHECK_V("HMM_TransposeM2", &Result.Elements[0][0], 4);
     return Result;
 }
 
@@ -1196,6 +1475,7 @@ static inline HMM_Mat2 HMM_AddM2(HMM_Mat2 Left, HMM_Mat2 Right)
     Result.Elements[1][0] = Left.Elements[1][0] + Right.Elements[1][0];
     Result.Elements[1][1] = Left.Elements[1][1] + Right.Elements[1][1];
 
+    HMM_DIAG_CHECK_V("HMM_AddM2", &Result.Elements[0][0], 4);
     return Result;
 }
 
@@ -1211,6 +1491,7 @@ static inline HMM_Mat2 HMM_SubM2(HMM_Mat2 Left, HMM_Mat2 Right)
     Result.Elements[1][0] = Left.Elements[1][0] - Right.Elements[1][0];
     Result.Elements[1][1] = Left.Elements[1][1] - Right.Elements[1][1];
 
+    HMM_DIAG_CHECK_V("HMM_SubM2", &Result.Elements[0][0], 4);
     return Result;
 }
 
@@ -1227,6 +1508,7 @@ static inline HMM_Vec2 HMM_MulM2V2(HMM_Mat2 Matrix, HMM_Vec2 Vector)
     Result.X += Vector.Elements[1] * Matrix.Columns[1].X;
     Result.Y += Vector.Elements[1] * Matrix.Columns[1].Y;
 
+    HMM_DIAG_CHECK_V("HMM_MulM2V2", &Result.X, 2);
     return Result;
 }
 
@@ -1239,6 +1521,7 @@ static inline HMM_Mat2 HMM_MulM2(HMM_Mat2 Left, HMM_Mat2 Right)
     Result.Columns[0] = HMM_MulM2V2(Left, Right.Columns[0]);
     Result.Columns[1] = HMM_MulM2V2(Left, Right.Columns[1]);
 
+    HMM_DIAG_CHECK_V("HMM_MulM2", &Result.Elements[0][0], 4);
     return Result;
 }
 
@@ -1254,6 +1537,7 @@ static inline HMM_Mat2 HMM_MulM2F(HMM_Mat2 Matrix, float Scalar)
     Result.Elements[1][0] = Matrix.Elements[1][0] * Scalar;
     Result.Elements[1][1] = Matrix.Elements[1][1] * Scalar;
 
+    HMM_DIAG_CHECK_V("HMM_MulM2F", &Result.Elements[0][0], 4);
     return Result;
 }
 
@@ -1269,6 +1553,7 @@ static inline HMM_Mat2 HMM_DivM2F(HMM_Mat2 Matrix, float Scalar)
     Result.Elements[1][0] = Matrix.Elements[1][0] / Scalar;
     Result.Elements[1][1] = Matrix.Elements[1][1] / Scalar;
 
+    HMM_DIAG_CHECK_V("HMM_DivM2F", &Result.Elements[0][0], 4);
     return Result;
 }
 
@@ -1276,7 +1561,9 @@ COVERAGE(HMM_DeterminantM2, 1)
 static inline float HMM_DeterminantM2(HMM_Mat2 Matrix)
 {
     ASSERT_COVERED(HMM_DeterminantM2);
-    return Matrix.Elements[0][0]*Matrix.Elements[1][1] - Matrix.Elements[0][1]*Matrix.Elements[1][0];
+    float Result = Matrix.Elements[0][0]*Matrix.Elements[1][1] - Matrix.Elements[0][1]*Matrix.Elements[1][0];
+    HMM_DIAG_CHECK_F("HMM_DeterminantM2", Result);
+    return Result;
 }
 
 
@@ -1292,6 +1579,7 @@ static inline HMM_Mat2 HMM_InvGeneralM2(HMM_Mat2 Matrix)
     Result.Elements[0][1] = InvDeterminant * -Matrix.Elements[0][1];
     Result.Elements[1][0] = InvDeterminant * -Matrix.Elements[1][0];
 
+    HMM_DIAG_CHECK_V("HMM_InvGeneralM2", &Result.Elements[0][0], 4);
     return Result;
 }
 
@@ -1334,6 +1622,7 @@ static inline HMM_Mat3 HMM_TransposeM3(HMM_Mat3 Matrix)
     Result.Elements[2][1] = Matrix.Elements[1][2];
     Result.Elements[2][0] = Matrix.Elements[0][2];
 
+    HMM_DIAG_CHECK_V("HMM_TransposeM3", &Result.Elements[0][0], 9);
     return Result;
 }
 
@@ -1354,6 +1643,7 @@ static inline HMM_Mat3 HMM_AddM3(HMM_Mat3 Left, HMM_Mat3 Right)
     Result.Elements[2][1] = Left.Elements[2][1] + Right.Elements[2][1];
     Result.Elements[2][2] = Left.Elements[2][2] + Right.Elements[2][2];
 
+    HMM_DIAG_CHECK_V("HMM_AddM3", &Result.Elements[0][0], 9);
     return Result;
 }
 
@@ -1374,6 +1664,7 @@ static inline HMM_Mat3 HMM_SubM3(HMM_Mat3 Left, HMM_Mat3 Right)
     Result.Elements[2][1] = Left.Elements[2][1] - Right.Elements[2][1];
     Result.Elements[2][2] = Left.Elements[2][2] - Right.Elements[2][2];
 
+    HMM_DIAG_CHECK_V("HMM_SubM3", &Result.Elements[0][0], 9);
     return Result;
 }
 
@@ -1396,6 +1687,7 @@ static inline HMM_Vec3 HMM_MulM3V3(HMM_Mat3 Matrix, HMM_Vec3 Vector)
     Result.Y += Vector.Elements[2] * Matrix.Columns[2].Y;
     Result.Z += Vector.Elements[2] * Matrix.Columns[2].Z;
 
+    HMM_DIAG_CHECK_V("HMM_MulM3V3", &Result.X, 3);
     return Result;
 }
 
@@ -1409,6 +1701,7 @@ static inline HMM_Mat3 HMM_MulM3(HMM_Mat3 Left, HMM_Mat3 Right)
     Result.Columns[1] = HMM_MulM3V3(Left, Right.Columns[1]);
     Result.Columns[2] = HMM_MulM3V3(Left, Right.Columns[2]);
 
+    HMM_DIAG_CHECK_V("HMM_MulM3", &Result.Elements[0][0], 9);
     return Result;
 }
 
@@ -1429,6 +1722,7 @@ static inline HMM_Mat3 HMM_MulM3F(HMM_Mat3 Matrix, float Scalar)
     Result.Elements[2][1] = Matrix.Elements[2][1] * Scalar;
     Result.Elements[2][2] = Matrix.Elements[2][2] * Scalar;
 
+    HMM_DIAG_CHECK_V("HMM_MulM3F", &Result.Elements[0][0], 9);
     return Result;
 }
 
@@ -1449,6 +1743,7 @@ static inline HMM_Mat3 HMM_DivM3F(HMM_Mat3 Matrix, float Scalar)
     Result.Elements[2][1] = Matrix.Elements[2][1] / Scalar;
     Result.Elements[2][2] = Matrix.Elements[2][2] / Scalar;
 
+    HMM_DIAG_CHECK_V("HMM_DivM3F", &Result.Elements[0][0], 9);
     return Result;
 }
 
@@ -1462,7 +1757,9 @@ static inline float HMM_DeterminantM3(HMM_Mat3 Matrix)
     Cross.Columns[1] = HMM_Cross(Matrix.Columns[2], Matrix.Columns[0]);
     Cross.Columns[2] = HMM_Cross(Matrix.Columns[0], Matrix.Columns[1]);
 
-    return HMM_DotV3(Cross.Columns[2], Matrix.Columns[2]);
+    float Result = HMM_DotV3(Cross.Columns[2], Matrix.Columns[2]);
+    HMM_DIAG_CHECK_F("HMM_DeterminantM3", Result);
+    return Result;
 }
 
 COVERAGE(HMM_InvGeneralM3, 1)
@@ -1482,6 +1779,7 @@ static inline HMM_Mat3 HMM_InvGeneralM3(HMM_Mat3 Matrix)
     Result.Columns[1] = HMM_MulV3F(Cross.Columns[1], InvDeterminant);
     Result.Columns[2] = HMM_MulV3F(Cross.Columns[2], InvDeterminant);
 
+    HMM_DIAG_CHECK_V("HMM_InvGeneralM3", &Result.Elements[0][0], 9);
     return HMM_TransposeM3(Result);
 }
 
@@ -1545,6 +1843,7 @@ static inline HMM_Mat4 HMM_TransposeM4(HMM_Mat4 Matrix)
     Result.Elements[3][3] = Matrix.Elements[3][3];
 #endif
 
+    HMM_DIAG_CHECK_V("HMM_TransposeM4", &Result.Elements[0][0], 16);
     return Result;
 }
 
@@ -1560,6 +1859,7 @@ static inline HMM_Mat4 HMM_AddM4(HMM_Mat4 Left, HMM_Mat4 Right)
     Result.Columns[2] = HMM_AddV4(Left.Columns[2], Right.Columns[2]);
     Result.Columns[3] = HMM_AddV4(Left.Columns[3], Right.Columns[3]);
 
+    HMM_DIAG_CHECK_V("HMM_AddM4", &Result.Elements[0][0], 16);
     return Result;
 }
 
@@ -1575,6 +1875,7 @@ static inline HMM_Mat4 HMM_SubM4(HMM_Mat4 Left, HMM_Mat4 Right)
     Result.Columns[2] = HMM_SubV4(Left.Columns[2], Right.Columns[2]);
     Result.Columns[3] = HMM_SubV4(Left.Columns[3], Right.Columns[3]);
 
+    HMM_DIAG_CHECK_V("HMM_SubM4", &Result.Elements[0][0], 16);
     return Result;
 }
 
@@ -1589,6 +1890,7 @@ static inline HMM_Mat4 HMM_MulM4(HMM_Mat4 Left, HMM_Mat4 Right)
     Result.Columns[2] = HMM_LinearCombineV4M4(Right.Columns[2], Left);
     Result.Columns[3] = HMM_LinearCombineV4M4(Right.Columns[3], Left);
 
+    HMM_DIAG_CHECK_V("HMM_MulM4", &Result.Elements[0][0], 16);
     return Result;
 }
 
@@ -1630,6 +1932,7 @@ static inline HMM_Mat4 HMM_MulM4F(HMM_Mat4 Matrix, float Scalar)
     Result.Elements[3][3] = Matrix.Elements[3][3] * Scalar;
 #endif
 
+    HMM_DIAG_CHECK_V("HMM_MulM4F", &Result.Elements[0][0], 16);
     return Result;
 }
 
@@ -1678,6 +1981,7 @@ static inline HMM_Mat4 HMM_DivM4F(HMM_Mat4 Matrix, float Scalar)
     Result.Elements[3][3] = Matrix.Elements[3][3] / Scalar;
 #endif
 
+    HMM_DIAG_CHECK_V("HMM_DivM4F", &Result.Elements[0][0], 16);
     return Result;
 }
 
@@ -1691,7 +1995,9 @@ static inline float HMM_DeterminantM4(HMM_Mat4 Matrix)
     HMM_Vec3 B10 = HMM_SubV3(HMM_MulV3F(Matrix.Columns[0].XYZ, Matrix.Columns[1].W), HMM_MulV3F(Matrix.Columns[1].XYZ, Matrix.Columns[0].W));
     HMM_Vec3 B32 = HMM_SubV3(HMM_MulV3F(Matrix.Columns[2].XYZ, Matrix.Columns[3].W), HMM_MulV3F(Matrix.Columns[3].XYZ, Matrix.Columns[2].W));
 
-    return HMM_DotV3(C01, B32) + HMM_DotV3(C23, B10);
+    float Result = HMM_DotV3(C01, B32) + HMM_DotV3(C23, B10);
+    HMM_DIAG_CHECK_F("HMM_DeterminantM4", Result);
+    return Result;
 }
 
 COVERAGE(HMM_InvGeneralM4, 1)
@@ -1718,6 +2024,7 @@ static inline HMM_Mat4 HMM_InvGeneralM4(HMM_Mat4 Matrix)
     Result.Columns[2] = HMM_V4V(HMM_AddV3(HMM_Cross(Matrix.Columns[3].XYZ, B10), HMM_MulV3F(C01, Matrix.Columns[3].W)), -HMM_DotV3(Matrix.Columns[3].XYZ, C01));
     Result.Columns[3] = HMM_V4V(HMM_SubV3(HMM_Cross(B10, Matrix.Columns[2].XYZ), HMM_MulV3F(C01, Matrix.Columns[2].W)), +HMM_DotV3(Matrix.Columns[2].XYZ, C01));
 
+    HMM_DIAG_CHECK_V("HMM_InvGeneralM4", &Result.Elements[0][0], 16);
     return HMM_TransposeM4(Result);
 }
 
@@ -1744,6 +2051,7 @@ static inline HMM_Mat4 HMM_Orthographic_RH_NO(float Left, float Right, float Bot
     Result.Elements[3][1] = (Bottom + Top) / (Bottom - Top);
     Result.Elements[3][2] = (Near + Far) / (Near - Far);
 
+    HMM_DIAG_CHECK_V("HMM_Orthographic_RH_NO", &Result.Elements[0][0], 16);
     return Result;
 }
 
@@ -1766,6 +2074,7 @@ static inline HMM_Mat4 HMM_Orthographic_RH_ZO(float Left, float Right, float Bot
     Result.Elements[3][1] = (Bottom + Top) / (Bottom - Top);
     Result.Elements[3][2] = (Near) / (Near - Far);
 
+    HMM_DIAG_CHECK_V("HMM_Orthographic_RH_ZO", &Result.Elements[0][0], 16);
     return Result;
 }
 
@@ -1780,6 +2089,7 @@ static inline HMM_Mat4 HMM_Orthographic_LH_NO(float Left, float Right, float Bot
     HMM_Mat4 Result = HMM_Orthographic_RH_NO(Left, Right, Bottom, Top, Near, Far);
     Result.Elements[2][2] = -Result.Elements[2][2];
 
+    HMM_DIAG_CHECK_V("HMM_Orthographic_LH_NO", &Result.Elements[0][0], 16);
     return Result;
 }
 
@@ -1794,6 +2104,7 @@ static inline HMM_Mat4 HMM_Orthographic_LH_ZO(float Left, float Right, float Bot
     HMM_Mat4 Result = HMM_Orthographic_RH_ZO(Left, Right, Bottom, Top, Near, Far);
     Result.Elements[2][2] = -Result.Elements[2][2];
 
+    HMM_DIAG_CHECK_V("HMM_Orthographic_LH_ZO", &Result.Elements[0][0], 16);
     return Result;
 }
 
@@ -1814,6 +2125,7 @@ static inline HMM_Mat4 HMM_InvOrthographic(HMM_Mat4 OrthoMatrix)
     Result.Elements[3][1] = -OrthoMatrix.Elements[3][1] * Result.Elements[1][1];
     Result.Elements[3][2] = -OrthoMatrix.Elements[3][2] * Result.Elements[2][2];
 
+    HMM_DIAG_CHECK_V("HMM_InvOrthographic", &Result.Elements[0][0], 16);
     return Result;
 }
 
@@ -1834,6 +2146,7 @@ static inline HMM_Mat4 HMM_Perspective_RH_NO(float FOV, float AspectRatio, float
     Result.Elements[2][2] = (Near + Far) / (Near - Far);
     Result.Elements[3][2] = (2.0f * Near * Far) / (Near - Far);
 
+    HMM_DIAG_CHECK_V("HMM_Perspective_RH_NO", &Result.Elements[0][0], 16);
     return Result;
 }
 
@@ -1854,6 +2167,7 @@ static inline HMM_Mat4 HMM_Perspective_RH_ZO(float FOV, float AspectRatio, float
     Result.Elements[2][2] = (Far) / (Near - Far);
     Result.Elements[3][2] = (Near * Far) / (Near - Far);
 
+    HMM_DIAG_CHECK_V("HMM_Perspective_RH_ZO", &Result.Elements[0][0], 16);
     return Result;
 }
 
@@ -1866,6 +2180,7 @@ static inline HMM_Mat4 HMM_Perspective_LH_NO(float FOV, float AspectRatio, float
     Result.Elements[2][2] = -Result.Elements[2][2];
     Result.Elements[2][3] = -Result.Elements[2][3];
 
+    HMM_DIAG_CHECK_V("HMM_Perspective_LH_NO", &Result.Elements[0][0], 16);
     return Result;
 }
 
@@ -1878,6 +2193,7 @@ static inline HMM_Mat4 HMM_Perspective_LH_ZO(float FOV, float AspectRatio, float
     Result.Elements[2][2] = -Result.Elements[2][2];
     Result.Elements[2][3] = -Result.Elements[2][3];
 
+    HMM_DIAG_CHECK_V("HMM_Perspective_LH_ZO", &Result.Elements[0][0], 16);
     return Result;
 }
 
@@ -1895,6 +2211,7 @@ static inline HMM_Mat4 HMM_InvPerspective_RH(HMM_Mat4 PerspectiveMatrix)
     Result.Elements[3][3] = PerspectiveMatrix.Elements[2][2] * Result.Elements[2][3];
     Result.Elements[3][2] = PerspectiveMatrix.Elements[2][3];
 
+    HMM_DIAG_CHECK_V("HMM_InvPerspective_RH", &Result.Elements[0][0], 16);
     return Result;
 }
 
@@ -1912,6 +2229,7 @@ static inline HMM_Mat4 HMM_InvPerspective_LH(HMM_Mat4 PerspectiveMatrix)
     Result.Elements[3][3] = PerspectiveMatrix.Elements[2][2] * -Result.Elements[2][3];
     Result.Elements[3][2] = PerspectiveMatrix.Elements[2][3];
 
+    HMM_DIAG_CHECK_V("HMM_InvPerspective_LH", &Result.Elements[0][0], 16);
     return Result;
 }
 
@@ -1925,6 +2243,7 @@ static inline HMM_Mat4 HMM_Translate(HMM_Vec3 Translation)
     Result.Elements[3][1] = Translation.Y;
     Result.Elements[3][2] = Translation.Z;
 
+    HMM_DIAG_CHECK_V("HMM_Translate", &Result.Elements[0][0], 16);
     return Result;
 }
 
@@ -1938,6 +2257,7 @@ static inline HMM_Mat4 HMM_InvTranslate(HMM_Mat4 TranslationMatrix)
     Result.Elements[3][1] = -Result.Elements[3][1];
     Result.Elements[3][2] = -Result.Elements[3][2];
 
+    HMM_DIAG_CHECK_V("HMM_InvTranslate", &Result.Elements[0][0], 16);
     return Result;
 }
 
@@ -1966,6 +2286,7 @@ static inline HMM_Mat4 HMM_Rotate_RH(float Angle, HMM_Vec3 Axis)
     Result.Elements[2][1] = (Axis.Z * Axis.Y * CosValue) - (Axis.X * SinTheta);
     Result.Elements[2][2] = (Axis.Z * Axis.Z * CosValue) + CosTheta;
 
+    HMM_DIAG_CHECK_V("HMM_Rotate_RH", &Result.Elements[0][0], 16);
     return Result;
 }
 
@@ -1974,14 +2295,18 @@ static inline HMM_Mat4 HMM_Rotate_LH(float Angle, HMM_Vec3 Axis)
 {
     ASSERT_COVERED(HMM_Rotate_LH);
     /* NOTE(lcf): Matrix will be inverse/transpose of RH. */
-    return HMM_Rotate_RH(-Angle, Axis);
+    HMM_Mat4 Result = HMM_Rotate_RH(-Angle, Axis);
+    HMM_DIAG_CHECK_V("HMM_Rotate_LH", &Result.Elements[0][0], 16);
+    return Result;
 }
 
 COVERAGE(HMM_InvRotate, 1)
 static inline HMM_Mat4 HMM_InvRotate(HMM_Mat4 RotationMatrix)
 {
     ASSERT_COVERED(HMM_InvRotate);
-    return HMM_TransposeM4(RotationMatrix);
+    HMM_Mat4 Result = HMM_TransposeM4(RotationMatrix);
+    HMM_DIAG_CHECK_V("HMM_InvRotate", &Result.Elements[0][0], 16);
+    return Result;
 }
 
 COVERAGE(HMM_Scale, 1)
@@ -1994,6 +2319,7 @@ static inline HMM_Mat4 HMM_Scale(HMM_Vec3 Scale)
     Result.Elements[1][1] = Scale.Y;
     Result.Elements[2][2] = Scale.Z;
 
+    HMM_DIAG_CHECK_V("HMM_Scale", &Result.Elements[0][0], 16);
     return Result;
 }
 
@@ -2007,6 +2333,7 @@ static inline HMM_Mat4 HMM_InvScale(HMM_Mat4 ScaleMatrix)
     Result.Elements[1][1] = 1.0f / Result.Elements[1][1];
     Result.Elements[2][2] = 1.0f / Result.Elements[2][2];
 
+    HMM_DIAG_CHECK_V("HMM_InvScale", &Result.Elements[0][0], 16);
     return Result;
 }
 
@@ -2034,6 +2361,7 @@ static inline HMM_Mat4 _HMM_LookAt(HMM_Vec3 F,  HMM_Vec3 S, HMM_Vec3 U,  HMM_Vec
     Result.Elements[3][2] = HMM_DotV3(F, Eye);
     Result.Elements[3][3] = 1.0f;
 
+    HMM_DIAG_CHECK_V("_HMM_LookAt", &Result.Elements[0][0], 16);
     return Result;
 }
 
@@ -2046,7 +2374,9 @@ static inline HMM_Mat4 HMM_LookAt_RH(HMM_Vec3 Eye, HMM_Vec3 Center, HMM_Vec3 Up)
     HMM_Vec3 S = HMM_NormV3(HMM_Cross(F, Up));
     HMM_Vec3 U = HMM_Cross(S, F);
 
-    return _HMM_LookAt(F, S, U, Eye);
+    HMM_Mat4 Result = _HMM_LookAt(F, S, U, Eye);
+    HMM_DIAG_CHECK_V("HMM_LookAt_RH", &Result.Elements[0][0], 16);
+    return Result;
 }
 
 COVERAGE(HMM_LookAt_LH, 1)
@@ -2058,7 +2388,9 @@ static inline HMM_Mat4 HMM_LookAt_LH(HMM_Vec3 Eye, HMM_Vec3 Center, HMM_Vec3 Up)
     HMM_Vec3 S = HMM_NormV3(HMM_Cross(F, Up));
     HMM_Vec3 U = HMM_Cross(S, F);
 
-    return _HMM_LookAt(F, S, U, Eye);
+    HMM_Mat4 Result = _HMM_LookAt(F, S, U, Eye);
+    HMM_DIAG_CHECK_V("HMM_LookAt_LH", &Result.Elements[0][0], 16);
+    return Result;
 }
 
 COVERAGE(HMM_InvLookAt, 1)
@@ -2085,6 +2417,7 @@ static inline HMM_Mat4 HMM_InvLookAt(HMM_Mat4 Matrix)
         (Rotation.Elements[2][0] + Rotation.Elements[2][1] + Rotation.Elements[2][2]);
     Result.Elements[3][3] = 1.0f;
 
+    HMM_DIAG_CHECK_V("HMM_InvLookAt", &Result.Elements[0][0], 16);
     return Result;
 }
 
@@ -2154,6 +2487,7 @@ static inline HMM_Quat HMM_AddQ(HMM_Quat Left, HMM_Quat Right)
     Result.W = Left.W + Right.W;
 #endif
 
+    HMM_DIAG_CHECK_V("HMM_AddQ", &Result.X, 4);
     return Result;
 }
 
@@ -2175,6 +2509,7 @@ static inline HMM_Quat HMM_SubQ(HMM_Quat Left, HMM_Quat Right)
     Result.W = Left.W - Right.W;
 #endif
 
+    HMM_DIAG_CHECK_V("HMM_SubQ", &Result.X, 4);
     return Result;
 }
 
@@ -2236,6 +2571,7 @@ static inline HMM_Quat HMM_MulQ(HMM_Quat Left, HMM_Quat Right)
     Result.W += Right.Elements[3] * +Left.Elements[3];
 #endif
 
+    HMM_DIAG_CHECK_V("HMM_MulQ", &Result.X, 4);
     return Result;
 }
 
@@ -2258,6 +2594,7 @@ static inline HMM_Quat HMM_MulQF(HMM_Quat Left, float Multiplicative)
     Result.W = Left.W * Multiplicative;
 #endif
 
+    HMM_DIAG_CHECK_V("HMM_MulQF", &Result.X, 4);
     return Result;
 }
 
@@ -2281,6 +2618,7 @@ static inline HMM_Quat HMM_DivQF(HMM_Quat Left, float Divnd)
     Result.W = Left.W / Divnd;
 #endif
 
+    HMM_DIAG_CHECK_V("HMM_DivQF", &Result.X, 4);
     return Result;
 }
 
@@ -2307,6 +2645,7 @@ static inline float HMM_DotQ(HMM_Quat Left, HMM_Quat Right)
     Result = ((Left.X * Right.X) + (Left.Z * Right.Z)) + ((Left.Y * Right.Y) + (Left.W * Right.W));
 #endif
 
+    HMM_DIAG_CHECK_F("HMM_DotQ", Result);
     return Result;
 }
 
@@ -2321,7 +2660,9 @@ static inline HMM_Quat HMM_InvQ(HMM_Quat Left)
     Result.Z = -Left.Z;
     Result.W = Left.W;
 
-    return HMM_DivQF(Result, (HMM_DotQ(Left, Left)));
+    Result = HMM_DivQF(Result, (HMM_DotQ(Left, Left)));
+    HMM_DIAG_CHECK_V("HMM_InvQ", &Result.X, 4);
+    return Result;
 }
 
 COVERAGE(HMM_NormQ, 1)
@@ -2334,6 +2675,7 @@ static inline HMM_Quat HMM_NormQ(HMM_Quat Quat)
     Vec = HMM_NormV4(Vec);
     HMM_Quat Result = HMM_QV4(Vec);
 
+    HMM_DIAG_CHECK_V("HMM_NormQ", &Result.X, 4);
     return Result;
 }
 
@@ -2368,6 +2710,7 @@ static inline HMM_Quat HMM_NLerp(HMM_Quat Left, float Time, HMM_Quat Right)
     HMM_Quat Result = _HMM_MixQ(Left, 1.0f-Time, Right, Time);
     Result = HMM_NormQ(Result);
 
+    HMM_DIAG_CHECK_V("HMM_NLerp", &Result.X, 4);
     return Result;
 }
 
@@ -2397,6 +2740,7 @@ static inline HMM_Quat HMM_SLerp(HMM_Quat Left, float Time, HMM_Quat Right)
         Result = HMM_NormQ(Result);
     }
 
+    HMM_DIAG_CHECK_V("HMM_SLerp", &Result.X, 4);
     return Result;
 }
 
@@ -2443,6 +2787,7 @@ static inline HMM_Mat4 HMM_QToM4(HMM_Quat Left)
     Result.Elements[3][2] = 0.0f;
     Result.Elements[3][3] = 1.0f;
 
+    HMM_DIAG_CHECK_V("HMM_QToM4", &Result.Elements[0][0], 16);
     return Result;
 }
 
@@ -2514,6 +2859,7 @@ static inline HMM_Quat HMM_M4ToQ_RH(HMM_Mat4 M)
 
     Q = HMM_MulQF(Q, 0.5f / HMM_SqrtF(T));
 
+    HMM_DIAG_CHECK_V("HMM_M4ToQ_RH", &Q.X, 4);
     return Q;
 }
 
@@ -2571,6 +2917,7 @@ static inline HMM_Quat HMM_M4ToQ_LH(HMM_Mat4 M)
 
     Q = HMM_MulQF(Q, 0.5f / HMM_SqrtF(T));
 
+    HMM_DIAG_CHECK_V("HMM_M4ToQ_LH", &Q.X, 4);
     return Q;
 }
 
@@ -2588,6 +2935,7 @@ static inline HMM_Quat HMM_QFromAxisAngle_RH(HMM_Vec3 Axis, float Angle)
     Result.XYZ = HMM_MulV3F(AxisNormalized, SineOfRotation);
     Result.W = HMM_CosF(Angle / 2.0f);
 
+    HMM_DIAG_CHECK_V("HMM_QFromAxisAngle_RH", &Result.X, 4);
     return Result;
 }
 
@@ -2596,7 +2944,9 @@ static inline HMM_Quat HMM_QFromAxisAngle_LH(HMM_Vec3 Axis, float Angle)
 {
     ASSERT_COVERED(HMM_QFromAxisAngle_LH);
 
-    return HMM_QFromAxisAngle_RH(Axis, -Angle);
+    HMM_Quat Result = HMM_QFromAxisAngle_RH(Axis, -Angle);
+    HMM_DIAG_CHECK_V("HMM_QFromAxisAngle_LH", &Result.X, 4);
+    return Result;
 }
 
 COVERAGE(HMM_QFromNormPair, 1)
@@ -2609,7 +2959,9 @@ static inline HMM_Quat HMM_QFromNormPair(HMM_Vec3 Left, HMM_Vec3 Right)
     Result.XYZ = HMM_Cross(Left, Right);
     Result.W = 1.0f + HMM_DotV3(Left, Right);
 
-    return HMM_NormQ(Result);
+    Result = HMM_NormQ(Result);
+    HMM_DIAG_CHECK_V("HMM_QFromNormPair", &Result.X, 4);
+    return Result;
 }
 
 COVERAGE(HMM_QFromVecPair, 1)
@@ -2617,7 +2969,9 @@ static inline HMM_Quat HMM_QFromVecPair(HMM_Vec3 Left, HMM_Vec3 Right)
 {
     ASSERT_COVERED(HMM_QFromVecPair);
 
-    return HMM_QFromNormPair(HMM_NormV3(Left), HMM_NormV3(Right));
+    HMM_Quat Result = HMM_QFromNormPair(HMM_NormV3(Left), HMM_NormV3(Right));
+    HMM_DIAG_CHECK_V("HMM_QFromVecPair", &Result.X, 4);
+    return Result;
 }
 
 COVERAGE(HMM_RotateV2, 1)
@@ -2628,7 +2982,9 @@ static inline HMM_Vec2 HMM_RotateV2(HMM_Vec2 V, float Angle)
     float sinA = HMM_SinF(Angle);
     float cosA = HMM_CosF(Angle);
 
-    return HMM_V2(V.X * cosA - V.Y * sinA, V.X * sinA + V.Y * cosA);
+    HMM_Vec2 Result = HMM_V2(V.X * cosA - V.Y * sinA, V.X * sinA + V.Y * cosA);
+    HMM_DIAG_CHECK_V("HMM_RotateV2", &Result.X, 2);
+    return Result;
 }
 
 // implementation from
@@ -2639,21 +2995,27 @@ static inline HMM_Vec3 HMM_RotateV3Q(HMM_Vec3 V, HMM_Quat Q)
     ASSERT_COVERED(HMM_RotateV3Q);
 
     HMM_Vec3 t = HMM_MulV3F(HMM_Cross(Q.XYZ, V), 2);
-    return HMM_AddV3(V, HMM_AddV3(HMM_MulV3F(t, Q.W), HMM_Cross(Q.XYZ, t)));
+    HMM_Vec3 Result = HMM_AddV3(V, HMM_AddV3(HMM_MulV3F(t, Q.W), HMM_Cross(Q.XYZ, t)));
+    HMM_DIAG_CHECK_V("HMM_RotateV3Q", &Result.X, 3);
+    return Result;
 }
 
 COVERAGE(HMM_RotateV3AxisAngle_LH, 1)
 static inline HMM_Vec3 HMM_RotateV3AxisAngle_LH(HMM_Vec3 V, HMM_Vec3 Axis, float Angle) {
     ASSERT_COVERED(HMM_RotateV3AxisAngle_LH);
 
-    return HMM_RotateV3Q(V, HMM_QFromAxisAngle_LH(Axis, Angle));
+    HMM_Vec3 Result = HMM_RotateV3Q(V, HMM_QFromAxisAngle_LH(Axis, Angle));
+    HMM_DIAG_CHECK_V("HMM_RotateV3AxisAngle_LH", &Result.X, 3);
+    return Result;
 }
 
 COVERAGE(HMM_RotateV3AxisAngle_RH, 1)
 static inline HMM_Vec3 HMM_RotateV3AxisAngle_RH(HMM_Vec3 V, HMM_Vec3 Axis, float Angle) {
     ASSERT_COVERED(HMM_RotateV3AxisAngle_RH);
 
-    return HMM_RotateV3Q(V, HMM_QFromAxisAngle_RH(Axis, Angle));
+    HMM_Vec3 Result = HMM_RotateV3Q(V, HMM_QFromAxisAngle_RH(Axis, Angle));
+    HMM_DIAG_CHECK_V("HMM_RotateV3AxisAngle_RH", &Result.X, 3);
+    return Result;
 }
 
 
