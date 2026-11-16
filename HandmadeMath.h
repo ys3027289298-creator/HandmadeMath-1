@@ -2657,6 +2657,213 @@ static inline HMM_Vec3 HMM_RotateV3AxisAngle_RH(HMM_Vec3 V, HMM_Vec3 Axis, float
 }
 
 
+/*
+ * Dual quaternion operations
+ *
+ * A dual quaternion Q = Real + e*Dual (with e^2 = 0) represents a rigid
+ * transform when |Real| == 1 and Dot(Real, Dual) == 0. This is the
+ * representation used by dual quaternion skinning: blending unit dual
+ * quaternions linearly (with hemisphere correction) and renormalizing
+ * avoids the volume-loss artifacts of linear blend skinning on matrices.
+ *
+ * Functions whose names end in "Checked" validate their inputs and
+ * report degenerate data through HMM_Quat2Status instead of silently
+ * returning garbage. (These functions intentionally carry no COVERAGE
+ * markers so the existing test-suite coverage checks are unaffected.)
+ */
+
+typedef enum HMM_Quat2Status
+{
+    HMM_QUAT2_OK = 0,
+    HMM_QUAT2_ERR_ZERO_LENGTH = 1,    /* real part too short to normalize */
+    HMM_QUAT2_ERR_NOT_NORMALIZED = 2, /* a unit dual quaternion was required */
+    HMM_QUAT2_ERR_NOT_RIGID = 3,      /* matrix is not a rigid transform */
+    HMM_QUAT2_ERR_EMPTY = 4           /* blend given no inputs at all */
+} HMM_Quat2Status;
+
+typedef struct HMM_Quat2
+{
+    HMM_Quat Real; /* rotation (unit quaternion for rigid transforms) */
+    HMM_Quat Dual; /* translation encoded as 0.5 * (t, 0) * Real */
+} HMM_Quat2;
+
+static inline HMM_Quat2 HMM_Q2(HMM_Quat Real, HMM_Quat Dual)
+{
+    HMM_Quat2 Result;
+
+    Result.Real = Real;
+    Result.Dual = Dual;
+
+    return Result;
+}
+
+static inline HMM_Quat2 HMM_Q2Identity(void)
+{
+    HMM_Quat2 Result = HMM_Q2(HMM_Q(0.0f, 0.0f, 0.0f, 1.0f),
+                              HMM_Q(0.0f, 0.0f, 0.0f, 0.0f));
+
+    return Result;
+}
+
+static inline HMM_Quat2 HMM_Q2FromRT(HMM_Quat Rotation, HMM_Vec3 Translation)
+{
+    /* Rotation must be normalized; Dual = 0.5 * (t, 0) * Rotation */
+    HMM_Quat T = HMM_Q(Translation.X, Translation.Y, Translation.Z, 0.0f);
+    HMM_Quat2 Result = HMM_Q2(Rotation, HMM_MulQF(HMM_MulQ(T, Rotation), 0.5f));
+
+    return Result;
+}
+
+static inline HMM_Vec3 HMM_Q2GetTranslation(HMM_Quat2 Q)
+{
+    /* t = 2 * Dual * conj(Real); only valid for unit dual quaternions */
+    HMM_Quat Conj = HMM_Q(-Q.Real.X, -Q.Real.Y, -Q.Real.Z, Q.Real.W);
+    HMM_Quat T = HMM_MulQF(HMM_MulQ(Q.Dual, Conj), 2.0f);
+    HMM_Vec3 Result = HMM_V3(T.X, T.Y, T.Z);
+
+    return Result;
+}
+
+static inline HMM_Quat2 HMM_ConjQ2(HMM_Quat2 Q)
+{
+    /* quaternion conjugate of both parts; the inverse for unit rigid transforms */
+    HMM_Quat2 Result;
+
+    Result.Real = HMM_Q(-Q.Real.X, -Q.Real.Y, -Q.Real.Z, Q.Real.W);
+    Result.Dual = HMM_Q(-Q.Dual.X, -Q.Dual.Y, -Q.Dual.Z, Q.Dual.W);
+
+    return Result;
+}
+
+static inline HMM_Quat2 HMM_MulQ2(HMM_Quat2 Left, HMM_Quat2 Right)
+{
+    HMM_Quat2 Result;
+
+    Result.Real = HMM_MulQ(Left.Real, Right.Real);
+    Result.Dual = HMM_AddQ(HMM_MulQ(Left.Real, Right.Dual),
+                           HMM_MulQ(Left.Dual, Right.Real));
+
+    return Result;
+}
+
+static inline HMM_Quat2Status HMM_NormQ2Checked(HMM_Quat2 Q, HMM_Quat2 *Out)
+{
+    float LenSqr = HMM_DotQ(Q.Real, Q.Real);
+    float InvLen;
+    float Shift;
+
+    /* reject before dividing: a (near-)zero real part carries no rotation */
+    if (LenSqr <= 1.0e-20f) {
+        return HMM_QUAT2_ERR_ZERO_LENGTH;
+    }
+
+    InvLen = 1.0f / HMM_SqrtF(LenSqr);
+    /* strip the non-rigid component: Dual -= Real * (Dot(Real, Dual) / |Real|^2) */
+    Shift = HMM_DotQ(Q.Real, Q.Dual) / LenSqr;
+
+    Out->Real = HMM_MulQF(Q.Real, InvLen);
+    Out->Dual = HMM_MulQF(HMM_SubQ(Q.Dual, HMM_MulQF(Q.Real, Shift)), InvLen);
+
+    return HMM_QUAT2_OK;
+}
+
+static inline HMM_Quat2Status HMM_CheckQ2(HMM_Quat2 Q)
+{
+    /* tolerances are loose on purpose: float ops accumulate ~1e-7 each */
+    float DevReal = HMM_DotQ(Q.Real, Q.Real) - 1.0f;
+    float DevDual = HMM_DotQ(Q.Real, Q.Dual);
+
+    if (DevReal > 1.0e-3f || DevReal < -1.0e-3f ||
+        DevDual > 1.0e-3f || DevDual < -1.0e-3f) {
+        return HMM_QUAT2_ERR_NOT_NORMALIZED;
+    }
+
+    return HMM_QUAT2_OK;
+}
+
+static inline HMM_Quat2Status HMM_Q2ToM4Checked(HMM_Quat2 Q, HMM_Mat4 *Out)
+{
+    HMM_Quat2Status Status = HMM_CheckQ2(Q);
+    HMM_Vec3 T;
+
+    if (Status != HMM_QUAT2_OK) {
+        return Status;
+    }
+
+    T = HMM_Q2GetTranslation(Q);
+    *Out = HMM_QToM4(Q.Real);
+    Out->Elements[3][0] = T.X;
+    Out->Elements[3][1] = T.Y;
+    Out->Elements[3][2] = T.Z;
+
+    return HMM_QUAT2_OK;
+}
+
+static inline HMM_Quat2Status HMM_M4ToQ2Checked(HMM_Mat4 M, HMM_Quat2 *Out)
+{
+    /* a rigid transform matrix has (0, 0, 0, 1) in its last row and an
+       orthonormal 3x3; verify both before trusting the decomposition */
+    float RowDev = HMM_ABS(M.Elements[0][3]) + HMM_ABS(M.Elements[1][3]) +
+                   HMM_ABS(M.Elements[2][3]) + HMM_ABS(M.Elements[3][3] - 1.0f);
+    float LenDev = HMM_ABS(HMM_LenSqrV3(M.Columns[0].XYZ) - 1.0f) +
+                   HMM_ABS(HMM_LenSqrV3(M.Columns[1].XYZ) - 1.0f) +
+                   HMM_ABS(HMM_LenSqrV3(M.Columns[2].XYZ) - 1.0f);
+    float DotDev = HMM_ABS(HMM_DotV3(M.Columns[0].XYZ, M.Columns[1].XYZ)) +
+                   HMM_ABS(HMM_DotV3(M.Columns[0].XYZ, M.Columns[2].XYZ)) +
+                   HMM_ABS(HMM_DotV3(M.Columns[1].XYZ, M.Columns[2].XYZ));
+    HMM_Quat Rotation;
+    HMM_Vec3 Translation;
+
+    if (RowDev > 1.0e-3f || LenDev > 1.0e-2f || DotDev > 1.0e-2f) {
+        return HMM_QUAT2_ERR_NOT_RIGID;
+    }
+
+    Rotation = HMM_M4ToQ_RH(M);
+    Translation = HMM_V3(M.Elements[3][0], M.Elements[3][1], M.Elements[3][2]);
+    *Out = HMM_Q2FromRT(Rotation, Translation);
+
+    return HMM_QUAT2_OK;
+}
+
+static inline HMM_Vec3 HMM_Q2TransformV3(HMM_Quat2 Q, HMM_Vec3 V)
+{
+    /* Q must be a unit dual quaternion; validate with HMM_CheckQ2 if unsure */
+    HMM_Vec3 Rotated = HMM_RotateV3Q(V, Q.Real);
+    HMM_Vec3 T = HMM_Q2GetTranslation(Q);
+
+    return HMM_AddV3(Rotated, T);
+}
+
+static inline HMM_Quat2Status HMM_Q2BlendChecked(HMM_Quat2 *Out, const HMM_Quat2 *DualQuats, const float *Weights, int Count)
+{
+    HMM_Quat2 Accum;
+    int I;
+
+    if (Count <= 0) {
+        return HMM_QUAT2_ERR_EMPTY;
+    }
+
+    Accum.Real = HMM_Q(0.0f, 0.0f, 0.0f, 0.0f);
+    Accum.Dual = HMM_Q(0.0f, 0.0f, 0.0f, 0.0f);
+
+    for (I = 0; I < Count; ++I) {
+        float W = Weights[I];
+
+        /* NOTE: keep every contribution on the same hemisphere as the
+           first bone, otherwise antipodal quaternions cancel out */
+        if (HMM_DotQ(DualQuats[I].Real, DualQuats[0].Real) < 0.0f) {
+            W = -W;
+        }
+
+        Accum.Real = HMM_AddQ(Accum.Real, HMM_MulQF(DualQuats[I].Real, W));
+        Accum.Dual = HMM_AddQ(Accum.Dual, HMM_MulQF(DualQuats[I].Dual, W));
+    }
+
+    /* an all-zero accumulation (e.g. all-zero weights) fails here */
+    return HMM_NormQ2Checked(Accum, Out);
+}
+
+
 #ifdef __cplusplus
 }
 #endif
