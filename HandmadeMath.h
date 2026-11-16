@@ -2656,6 +2656,299 @@ static inline HMM_Vec3 HMM_RotateV3AxisAngle_RH(HMM_Vec3 V, HMM_Vec3 Axis, float
     return HMM_RotateV3Q(V, HMM_QFromAxisAngle_RH(Axis, Angle));
 }
 
+/*
+ * Jacobi eigenvalue decomposition for real symmetric matrices.
+ *
+ * HMM_EigenSymmetricM3/HMM_EigenSymmetricM4 compute the eigenvalues and
+ * eigenvectors of a symmetric matrix using cyclic Jacobi iteration.
+ *
+ * MaxIterations sets the maximum number of Jacobi sweeps (one sweep applies
+ * one rotation per above-diagonal pair), and Threshold is the convergence
+ * threshold: iteration stops once the largest absolute off-diagonal element
+ * is less than or equal to Threshold.
+ *
+ * The return value is HMM_EIGEN_OK on success. If the input matrix is not
+ * symmetric (within a small relative tolerance) the functions return
+ * HMM_EIGEN_NOT_SYMMETRIC. Invalid arguments (NULL Result, MaxIterations < 1
+ * or Threshold < 0) return HMM_EIGEN_INVALID_ARGUMENT. On any error the
+ * contents of Result are zeroed.
+ *
+ * Non-convergence is not an error: if the iteration does not converge within
+ * MaxIterations sweeps the functions still return HMM_EIGEN_OK, set
+ * Result->Converged to 0 and Result->Iterations to MaxIterations, and fill
+ * Result with the best approximation found so far.
+ *
+ * On success EigenValues are sorted in descending order and the columns of
+ * EigenVectors are the matching eigenvectors. For the 3x3 variant the fourth
+ * eigenvalue is 0 and the fourth eigenvector is the unit W axis.
+ */
+#define HMM_EIGEN_OK 0
+#define HMM_EIGEN_NOT_SYMMETRIC (-1)
+#define HMM_EIGEN_INVALID_ARGUMENT (-2)
+
+typedef struct HMM_EigenResult
+{
+    int Converged;
+    int Iterations;
+    int Size;
+    float EigenValues[4];
+    HMM_Mat4 EigenVectors;
+} HMM_EigenResult;
+
+static inline void HMM_EigenResetResult(HMM_EigenResult *Result)
+{
+    int I, J;
+
+    Result->Converged = 0;
+    Result->Iterations = 0;
+    Result->Size = 0;
+
+    for (I = 0; I < 4; ++I)
+    {
+        Result->EigenValues[I] = 0.0f;
+        for (J = 0; J < 4; ++J)
+        {
+            Result->EigenVectors.Elements[I][J] = 0.0f;
+        }
+    }
+}
+
+static inline int HMM_EigenIsSymmetric(const float *A, int N)
+{
+    float MaxAbs = 0.0f;
+    float Tol;
+    int I, J;
+
+    for (J = 0; J < N; ++J)
+    {
+        for (I = 0; I < N; ++I)
+        {
+            float Abs = HMM_ABS(A[J * 4 + I]);
+            if (Abs > MaxAbs)
+            {
+                MaxAbs = Abs;
+            }
+        }
+    }
+
+    Tol = 1e-4f * (MaxAbs + 1.0f);
+
+    for (J = 0; J < N; ++J)
+    {
+        for (I = J + 1; I < N; ++I)
+        {
+            if (HMM_ABS(A[J * 4 + I] - A[I * 4 + J]) > Tol)
+            {
+                return 0;
+            }
+        }
+    }
+
+    return 1;
+}
+
+static inline int HMM_EigenJacobiCore(float *A, float *V, int N, int MaxIterations, float Threshold, int *OutIterations)
+{
+    int Converged = 0;
+    int Iterations = 0;
+    int Sweep, P, Q, K;
+
+    for (Sweep = 0; Sweep < MaxIterations; ++Sweep)
+    {
+        float OffMax = 0.0f;
+
+        for (Q = 1; Q < N; ++Q)
+        {
+            for (P = 0; P < Q; ++P)
+            {
+                float Abs = HMM_ABS(A[Q * 4 + P]);
+                if (Abs > OffMax)
+                {
+                    OffMax = Abs;
+                }
+            }
+        }
+
+        if (OffMax <= Threshold)
+        {
+            Converged = 1;
+            break;
+        }
+
+        ++Iterations;
+
+        for (Q = 1; Q < N; ++Q)
+        {
+            for (P = 0; P < Q; ++P)
+            {
+                float Apq = A[Q * 4 + P];
+
+                if (HMM_ABS(Apq) > Threshold)
+                {
+                    float App = A[P * 4 + P];
+                    float Aqq = A[Q * 4 + Q];
+                    float Theta = (Aqq - App) / (2.0f * Apq);
+                    float Sign = (Theta >= 0.0f) ? 1.0f : -1.0f;
+                    float T = Sign / (HMM_ABS(Theta) + HMM_SqrtF(Theta * Theta + 1.0f));
+                    float C = 1.0f / HMM_SqrtF(T * T + 1.0f);
+                    float S = T * C;
+
+                    for (K = 0; K < N; ++K)
+                    {
+                        float Akp = A[P * 4 + K];
+                        float Akq = A[Q * 4 + K];
+                        A[P * 4 + K] = C * Akp - S * Akq;
+                        A[Q * 4 + K] = S * Akp + C * Akq;
+                    }
+
+                    for (K = 0; K < N; ++K)
+                    {
+                        float Apk = A[K * 4 + P];
+                        float Aqk = A[K * 4 + Q];
+                        A[K * 4 + P] = C * Apk - S * Aqk;
+                        A[K * 4 + Q] = S * Apk + C * Aqk;
+                    }
+
+                    for (K = 0; K < N; ++K)
+                    {
+                        float Vkp = V[P * 4 + K];
+                        float Vkq = V[Q * 4 + K];
+                        V[P * 4 + K] = C * Vkp - S * Vkq;
+                        V[Q * 4 + K] = S * Vkp + C * Vkq;
+                    }
+                }
+            }
+        }
+    }
+
+    *OutIterations = Iterations;
+
+    return Converged;
+}
+
+static inline int HMM_EigenFinish(float *A, float *V, int N, int MaxIterations, float Threshold, HMM_EigenResult *Result)
+{
+    float Values[4];
+    int I, J, K;
+    int Converged;
+
+    if (!HMM_EigenIsSymmetric(A, N))
+    {
+        HMM_EigenResetResult(Result);
+        return HMM_EIGEN_NOT_SYMMETRIC;
+    }
+
+    Converged = HMM_EigenJacobiCore(A, V, N, MaxIterations, Threshold, &Result->Iterations);
+    Result->Converged = Converged;
+
+    for (I = 0; I < N; ++I)
+    {
+        Values[I] = A[I * 4 + I];
+    }
+
+    for (I = 0; I + 1 < N; ++I)
+    {
+        int Best = I;
+        for (J = I + 1; J < N; ++J)
+        {
+            if (Values[Best] < Values[J])
+            {
+                Best = J;
+            }
+        }
+        if (Best != I)
+        {
+            float Tmp = Values[I];
+            Values[I] = Values[Best];
+            Values[Best] = Tmp;
+
+            for (K = 0; K < N; ++K)
+            {
+                float TmpV = V[I * 4 + K];
+                V[I * 4 + K] = V[Best * 4 + K];
+                V[Best * 4 + K] = TmpV;
+            }
+        }
+    }
+
+    for (I = 0; I < N; ++I)
+    {
+        Result->EigenValues[I] = Values[I];
+        for (J = 0; J < N; ++J)
+        {
+            Result->EigenVectors.Elements[I][J] = V[I * 4 + J];
+        }
+    }
+
+    for (I = N; I < 4; ++I)
+    {
+        Result->EigenVectors.Elements[I][I] = 1.0f;
+    }
+
+    return HMM_EIGEN_OK;
+}
+
+static inline int HMM_EigenSymmetricM4(HMM_Mat4 Matrix, int MaxIterations, float Threshold, HMM_EigenResult *Result)
+{
+    float A[16];
+    float V[16];
+    int I, J;
+
+    if (Result == 0 || MaxIterations < 1 || Threshold < 0.0f)
+    {
+        return HMM_EIGEN_INVALID_ARGUMENT;
+    }
+
+    HMM_EigenResetResult(Result);
+    Result->Size = 4;
+
+    for (J = 0; J < 4; ++J)
+    {
+        for (I = 0; I < 4; ++I)
+        {
+            A[J * 4 + I] = Matrix.Elements[J][I];
+            V[J * 4 + I] = (I == J) ? 1.0f : 0.0f;
+        }
+    }
+
+    return HMM_EigenFinish(A, V, 4, MaxIterations, Threshold, Result);
+}
+
+static inline int HMM_EigenSymmetricM3(HMM_Mat3 Matrix, int MaxIterations, float Threshold, HMM_EigenResult *Result)
+{
+    float A[16];
+    float V[16];
+    int I, J;
+
+    if (Result == 0 || MaxIterations < 1 || Threshold < 0.0f)
+    {
+        return HMM_EIGEN_INVALID_ARGUMENT;
+    }
+
+    HMM_EigenResetResult(Result);
+    Result->Size = 3;
+
+    for (J = 0; J < 4; ++J)
+    {
+        for (I = 0; I < 4; ++I)
+        {
+            A[J * 4 + I] = 0.0f;
+            V[J * 4 + I] = 0.0f;
+        }
+    }
+
+    for (J = 0; J < 3; ++J)
+    {
+        for (I = 0; I < 3; ++I)
+        {
+            A[J * 4 + I] = Matrix.Elements[J][I];
+        }
+        V[J * 4 + J] = 1.0f;
+    }
+
+    return HMM_EigenFinish(A, V, 3, MaxIterations, Threshold, Result);
+}
+
 
 #ifdef __cplusplus
 }
