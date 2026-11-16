@@ -2657,6 +2657,491 @@ static inline HMM_Vec3 HMM_RotateV3AxisAngle_RH(HMM_Vec3 V, HMM_Vec3 Axis, float
 }
 
 
+/*
+ * Cubic Hermite path interpolation
+ *
+ * A path is defined by an array of key points and, optionally, one tangent per
+ * key point. Tangents are derivatives of position with respect to the knot
+ * parameter:
+ *
+ *   - Uniform parameterization: knot i is at t = i, so a tangent is dP/di.
+ *   - Chord-length parameterization: knot i is at the cumulative chord length
+ *     up to point i, so a tangent is dP/ds with s measured in world units.
+ *
+ * A segment [i, i+1] is evaluated by scaling the endpoint tangents by the
+ * segment's knot span, then applying cubic Hermite interpolation with a local
+ * parameter in [0, 1]. Passing NULL for the tangent array makes every path
+ * function estimate tangents automatically with Catmull-Rom (one-sided
+ * differences at the ends, non-uniform differences for chord-length).
+ *
+ * No allocation is performed by any of these functions, and every fallible
+ * function reports errors through HMM_PathResult instead of aborting.
+ *
+ * The public path functions validate their arguments on every call, which is
+ * O(PointCount) for chord-length parameterization. For per-frame animation,
+ * validate once (and optionally precompute tangents with HMM_PathTangentsV3),
+ * then drive HMM_PathSegmentPointV3 / HMM_PathSegmentDerivativeV3 directly:
+ * those take an already-validated path and are O(1) per evaluation.
+ */
+
+typedef enum HMM_PathParameterization
+{
+    HMM_PathParameterization_Uniform = 0,
+    HMM_PathParameterization_ChordLength = 1
+} HMM_PathParameterization;
+
+typedef enum HMM_PathResult
+{
+    HMM_PathResult_OK = 0,
+    HMM_PathResult_NullArgument = 1,
+    HMM_PathResult_TooFewPoints = 2,
+    HMM_PathResult_InvalidParameterization = 3,
+    HMM_PathResult_InvalidInterval = 4,
+    HMM_PathResult_OutOfRange = 5,
+    HMM_PathResult_InvalidSampleCount = 6
+} HMM_PathResult;
+
+static inline const char *HMM_PathResultString(HMM_PathResult Result)
+{
+    switch (Result)
+    {
+        case HMM_PathResult_OK:
+            return "ok";
+        case HMM_PathResult_NullArgument:
+            return "null argument";
+        case HMM_PathResult_TooFewPoints:
+            return "too few points";
+        case HMM_PathResult_InvalidParameterization:
+            return "invalid parameterization";
+        case HMM_PathResult_InvalidInterval:
+            return "invalid interval";
+        case HMM_PathResult_OutOfRange:
+            return "out of range";
+        case HMM_PathResult_InvalidSampleCount:
+            return "invalid sample count";
+        default:
+            return "unknown error";
+    }
+}
+
+// Evaluates cubic Hermite interpolation on [0, 1]. M0 and M1 are the
+// derivatives of the curve at P0 and P1 with respect to T.
+static inline HMM_Vec3 HMM_HermiteV3(HMM_Vec3 P0, HMM_Vec3 M0, HMM_Vec3 P1, HMM_Vec3 M1, float T)
+{
+    float T2 = T * T;
+    float T3 = T2 * T;
+    float H00 = 2.0f * T3 - 3.0f * T2 + 1.0f;
+    float H10 = T3 - 2.0f * T2 + T;
+    float H01 = -2.0f * T3 + 3.0f * T2;
+    float H11 = T3 - T2;
+
+    return HMM_AddV3(
+        HMM_AddV3(HMM_MulV3F(P0, H00), HMM_MulV3F(M0, H10)),
+        HMM_AddV3(HMM_MulV3F(P1, H01), HMM_MulV3F(M1, H11))
+    );
+}
+
+// Derivative of HMM_HermiteV3 with respect to T.
+static inline HMM_Vec3 HMM_HermiteDerivativeV3(HMM_Vec3 P0, HMM_Vec3 M0, HMM_Vec3 P1, HMM_Vec3 M1, float T)
+{
+    float T2 = T * T;
+    float H00 = 6.0f * T2 - 6.0f * T;
+    float H10 = 3.0f * T2 - 4.0f * T + 1.0f;
+    float H01 = -6.0f * T2 + 6.0f * T;
+    float H11 = 3.0f * T2 - 2.0f * T;
+
+    return HMM_AddV3(
+        HMM_AddV3(HMM_MulV3F(P0, H00), HMM_MulV3F(M0, H10)),
+        HMM_AddV3(HMM_MulV3F(P1, H01), HMM_MulV3F(M1, H11))
+    );
+}
+
+// Evaluates a cubic Hermite segment whose parameter interval is [Start, End].
+// M0 and M1 are derivatives with respect to T (the same parameter as Start,
+// End, and T), so they are scaled internally by the interval length.
+// Returns HMM_PathResult_InvalidInterval when Start >= End (this also rejects
+// NaN bounds), and HMM_PathResult_OutOfRange when T lies outside [Start, End].
+static inline HMM_PathResult HMM_HermiteIntervalV3(HMM_Vec3 P0, HMM_Vec3 M0, HMM_Vec3 P1, HMM_Vec3 M1,
+                                                   float Start, float End, float T, HMM_Vec3 *OutPoint)
+{
+    float Span;
+    float LocalT;
+
+    if (!OutPoint)
+    {
+        return HMM_PathResult_NullArgument;
+    }
+
+    if (!(Start < End))
+    {
+        return HMM_PathResult_InvalidInterval;
+    }
+
+    if (!(T >= Start && T <= End))
+    {
+        return HMM_PathResult_OutOfRange;
+    }
+
+    Span = End - Start;
+    LocalT = (T - Start) / Span;
+
+    *OutPoint = HMM_HermiteV3(P0, HMM_MulV3F(M0, Span), P1, HMM_MulV3F(M1, Span), LocalT);
+
+    return HMM_PathResult_OK;
+}
+
+// Span of the knot interval [Index, Index + 1] for a path.
+static inline float HMM_PathSpanV3(const HMM_Vec3 *Points, int Index, HMM_PathParameterization Parameterization)
+{
+    if (Parameterization == HMM_PathParameterization_ChordLength)
+    {
+        return HMM_LenV3(HMM_SubV3(Points[Index + 1], Points[Index]));
+    }
+
+    return 1.0f;
+}
+
+// Catmull-Rom tangent at a key, expressed in the knot parameter described in
+// the section comment above.
+static inline HMM_Vec3 HMM_PathAutoTangentV3(const HMM_Vec3 *Points, int PointCount,
+                                             HMM_PathParameterization Parameterization, int Index)
+{
+    float Span;
+
+    if (Index <= 0)
+    {
+        Span = HMM_PathSpanV3(Points, 0, Parameterization);
+        if (Span > 0.0f)
+        {
+            return HMM_MulV3F(HMM_SubV3(Points[1], Points[0]), 1.0f / Span);
+        }
+    }
+    else if (Index >= PointCount - 1)
+    {
+        Span = HMM_PathSpanV3(Points, PointCount - 2, Parameterization);
+        if (Span > 0.0f)
+        {
+            return HMM_MulV3F(HMM_SubV3(Points[PointCount - 1], Points[PointCount - 2]), 1.0f / Span);
+        }
+    }
+    else
+    {
+        Span = HMM_PathSpanV3(Points, Index - 1, Parameterization)
+             + HMM_PathSpanV3(Points, Index, Parameterization);
+        if (Span > 0.0f)
+        {
+            return HMM_MulV3F(HMM_SubV3(Points[Index + 1], Points[Index - 1]), 1.0f / Span);
+        }
+    }
+
+    return HMM_V3(0.0f, 0.0f, 0.0f);
+}
+
+// Tangent at a key: the caller's value when Tangents is non-NULL, otherwise a
+// Catmull-Rom estimate.
+static inline HMM_Vec3 HMM_PathTangentV3(const HMM_Vec3 *Points, const HMM_Vec3 *Tangents, int PointCount,
+                                         HMM_PathParameterization Parameterization, int Index)
+{
+    if (Tangents)
+    {
+        return Tangents[Index];
+    }
+
+    return HMM_PathAutoTangentV3(Points, PointCount, Parameterization, Index);
+}
+
+static inline HMM_PathResult HMM_PathValidateV3(const HMM_Vec3 *Points, int PointCount,
+                                                HMM_PathParameterization Parameterization)
+{
+    int Index;
+
+    if (!Points)
+    {
+        return HMM_PathResult_NullArgument;
+    }
+
+    if (PointCount < 2)
+    {
+        return HMM_PathResult_TooFewPoints;
+    }
+
+    if (Parameterization != HMM_PathParameterization_Uniform
+        && Parameterization != HMM_PathParameterization_ChordLength)
+    {
+        return HMM_PathResult_InvalidParameterization;
+    }
+
+    if (Parameterization == HMM_PathParameterization_ChordLength)
+    {
+        for (Index = 0; Index < PointCount - 1; ++Index)
+        {
+            if (!(HMM_PathSpanV3(Points, Index, Parameterization) > 0.0f))
+            {
+                return HMM_PathResult_InvalidInterval;
+            }
+        }
+    }
+
+    return HMM_PathResult_OK;
+}
+
+// Point on a validated segment with local parameter LocalT in [0, 1].
+static inline HMM_Vec3 HMM_PathSegmentPointV3(const HMM_Vec3 *Points, const HMM_Vec3 *Tangents, int PointCount,
+                                              HMM_PathParameterization Parameterization, int Segment, float LocalT)
+{
+    float Span = (Parameterization == HMM_PathParameterization_ChordLength)
+               ? HMM_PathSpanV3(Points, Segment, Parameterization)
+               : 1.0f;
+
+    return HMM_HermiteV3(
+        Points[Segment],
+        HMM_MulV3F(HMM_PathTangentV3(Points, Tangents, PointCount, Parameterization, Segment), Span),
+        Points[Segment + 1],
+        HMM_MulV3F(HMM_PathTangentV3(Points, Tangents, PointCount, Parameterization, Segment + 1), Span),
+        LocalT
+    );
+}
+
+// Derivative with respect to the segment's local parameter.
+static inline HMM_Vec3 HMM_PathSegmentDerivativeV3(const HMM_Vec3 *Points, const HMM_Vec3 *Tangents, int PointCount,
+                                                   HMM_PathParameterization Parameterization, int Segment, float LocalT)
+{
+    float Span = (Parameterization == HMM_PathParameterization_ChordLength)
+               ? HMM_PathSpanV3(Points, Segment, Parameterization)
+               : 1.0f;
+
+    return HMM_HermiteDerivativeV3(
+        Points[Segment],
+        HMM_MulV3F(HMM_PathTangentV3(Points, Tangents, PointCount, Parameterization, Segment), Span),
+        Points[Segment + 1],
+        HMM_MulV3F(HMM_PathTangentV3(Points, Tangents, PointCount, Parameterization, Segment + 1), Span),
+        LocalT
+    );
+}
+
+// Fills OutTangents with Catmull-Rom tangents, one per key point. This is
+// useful when the caller wants to inspect or edit the automatic tangents before
+// animating; path evaluation itself also accepts NULL to mean "estimate these".
+static inline HMM_PathResult HMM_PathTangentsV3(const HMM_Vec3 *Points, int PointCount,
+                                                HMM_PathParameterization Parameterization,
+                                                HMM_Vec3 *OutTangents)
+{
+    HMM_PathResult Result;
+    int Index;
+
+    if (!OutTangents)
+    {
+        return HMM_PathResult_NullArgument;
+    }
+
+    Result = HMM_PathValidateV3(Points, PointCount, Parameterization);
+    if (Result != HMM_PathResult_OK)
+    {
+        return Result;
+    }
+
+    for (Index = 0; Index < PointCount; ++Index)
+    {
+        OutTangents[Index] = HMM_PathAutoTangentV3(Points, PointCount, Parameterization, Index);
+    }
+
+    return HMM_PathResult_OK;
+}
+
+// Evaluates one segment at a local parameter in [0, 1]. Tangents may be NULL to
+// use Catmull-Rom estimates.
+static inline HMM_PathResult HMM_PathEvalSegmentV3(const HMM_Vec3 *Points, const HMM_Vec3 *Tangents, int PointCount,
+                                                   HMM_PathParameterization Parameterization,
+                                                   int Segment, float LocalT, HMM_Vec3 *OutPoint)
+{
+    HMM_PathResult Result;
+
+    if (!OutPoint)
+    {
+        return HMM_PathResult_NullArgument;
+    }
+
+    Result = HMM_PathValidateV3(Points, PointCount, Parameterization);
+    if (Result != HMM_PathResult_OK)
+    {
+        return Result;
+    }
+
+    if (Segment < 0 || Segment >= PointCount - 1)
+    {
+        return HMM_PathResult_OutOfRange;
+    }
+
+    if (!(LocalT >= 0.0f && LocalT <= 1.0f))
+    {
+        return HMM_PathResult_OutOfRange;
+    }
+
+    *OutPoint = HMM_PathSegmentPointV3(Points, Tangents, PointCount, Parameterization, Segment, LocalT);
+
+    return HMM_PathResult_OK;
+}
+
+// Derivative of one segment with respect to its local parameter, in [0, 1].
+// This is the curve tangent used for orientation; its magnitude is the speed
+// with respect to the segment-local parameter.
+static inline HMM_PathResult HMM_PathEvalSegmentTangentV3(const HMM_Vec3 *Points, const HMM_Vec3 *Tangents,
+                                                          int PointCount, HMM_PathParameterization Parameterization,
+                                                          int Segment, float LocalT, HMM_Vec3 *OutTangent)
+{
+    HMM_PathResult Result;
+
+    if (!OutTangent)
+    {
+        return HMM_PathResult_NullArgument;
+    }
+
+    Result = HMM_PathValidateV3(Points, PointCount, Parameterization);
+    if (Result != HMM_PathResult_OK)
+    {
+        return Result;
+    }
+
+    if (Segment < 0 || Segment >= PointCount - 1)
+    {
+        return HMM_PathResult_OutOfRange;
+    }
+
+    if (!(LocalT >= 0.0f && LocalT <= 1.0f))
+    {
+        return HMM_PathResult_OutOfRange;
+    }
+
+    *OutTangent = HMM_PathSegmentDerivativeV3(Points, Tangents, PointCount, Parameterization, Segment, LocalT);
+
+    return HMM_PathResult_OK;
+}
+
+// Evaluates the whole path at U in [0, 1]. For uniform parameterization each
+// segment receives an equal share of U; for chord-length parameterization U is
+// proportional to estimated arc length, so motion is roughly constant-speed.
+static inline HMM_PathResult HMM_PathEvalV3(const HMM_Vec3 *Points, const HMM_Vec3 *Tangents, int PointCount,
+                                            HMM_PathParameterization Parameterization, float U, HMM_Vec3 *OutPoint)
+{
+    HMM_PathResult Result;
+    int Segment;
+    float LocalT;
+    int Index;
+    float Total;
+    float Target;
+    float Accum;
+
+    if (!OutPoint)
+    {
+        return HMM_PathResult_NullArgument;
+    }
+
+    Result = HMM_PathValidateV3(Points, PointCount, Parameterization);
+    if (Result != HMM_PathResult_OK)
+    {
+        return Result;
+    }
+
+    if (!(U >= 0.0f && U <= 1.0f))
+    {
+        return HMM_PathResult_OutOfRange;
+    }
+
+    if (Parameterization == HMM_PathParameterization_Uniform)
+    {
+        float Scaled = U * (float)(PointCount - 1);
+
+        Segment = (int)Scaled;
+        if (Segment > PointCount - 2)
+        {
+            Segment = PointCount - 2;
+        }
+        LocalT = Scaled - (float)Segment;
+    }
+    else
+    {
+        Total = 0.0f;
+        for (Index = 0; Index < PointCount - 1; ++Index)
+        {
+            Total += HMM_PathSpanV3(Points, Index, Parameterization);
+        }
+
+        Target = U * Total;
+        Accum = 0.0f;
+        Segment = PointCount - 2;
+        LocalT = 1.0f;
+
+        for (Index = 0; Index < PointCount - 1; ++Index)
+        {
+            float Span = HMM_PathSpanV3(Points, Index, Parameterization);
+
+            if (Target <= Accum + Span || Index == PointCount - 2)
+            {
+                Segment = Index;
+                LocalT = (Target - Accum) / Span;
+                break;
+            }
+
+            Accum += Span;
+        }
+
+        LocalT = HMM_Clamp(0.0f, LocalT, 1.0f);
+    }
+
+    *OutPoint = HMM_PathSegmentPointV3(Points, Tangents, PointCount, Parameterization, Segment, LocalT);
+
+    return HMM_PathResult_OK;
+}
+
+// Estimates the path's arc length by sampling each segment SamplesPerSegment
+// times. Returns HMM_PathResult_InvalidSampleCount when SamplesPerSegment <= 0.
+static inline HMM_PathResult HMM_PathArcLengthV3(const HMM_Vec3 *Points, const HMM_Vec3 *Tangents, int PointCount,
+                                                 HMM_PathParameterization Parameterization,
+                                                 int SamplesPerSegment, float *OutLength)
+{
+    HMM_PathResult Result;
+    int Segment;
+    int Sample;
+    float Total;
+
+    if (!OutLength)
+    {
+        return HMM_PathResult_NullArgument;
+    }
+
+    Result = HMM_PathValidateV3(Points, PointCount, Parameterization);
+    if (Result != HMM_PathResult_OK)
+    {
+        return Result;
+    }
+
+    if (SamplesPerSegment <= 0)
+    {
+        return HMM_PathResult_InvalidSampleCount;
+    }
+
+    Total = 0.0f;
+
+    for (Segment = 0; Segment < PointCount - 1; ++Segment)
+    {
+        HMM_Vec3 Previous = HMM_PathSegmentPointV3(Points, Tangents, PointCount, Parameterization, Segment, 0.0f);
+
+        for (Sample = 1; Sample <= SamplesPerSegment; ++Sample)
+        {
+            float LocalT = (float)Sample / (float)SamplesPerSegment;
+            HMM_Vec3 Current = HMM_PathSegmentPointV3(Points, Tangents, PointCount, Parameterization, Segment, LocalT);
+
+            Total += HMM_LenV3(HMM_SubV3(Current, Previous));
+            Previous = Current;
+        }
+    }
+
+    *OutLength = Total;
+
+    return HMM_PathResult_OK;
+}
+
+
 #ifdef __cplusplus
 }
 #endif
