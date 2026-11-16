@@ -2656,6 +2656,132 @@ static inline HMM_Vec3 HMM_RotateV3AxisAngle_RH(HMM_Vec3 V, HMM_Vec3 Axis, float
     return HMM_RotateV3Q(V, HMM_QFromAxisAngle_RH(Axis, Angle));
 }
 
+/*
+ * Matrix decomposition
+ */
+
+// The result of decomposing an affine 4x4 matrix into its simple
+// transformations. The components are defined such that the original matrix
+// can be recovered as
+//
+//     M = T * R * Sh * S
+//
+// where T translates by Translation, R rotates by Rotation, S scales by
+// Scale, and Sh is the upper-triangular shear matrix
+//
+//     | 1  XY  XZ |
+//     | 0  1   YZ |
+//     | 0  0   1  |
+//
+// built from Shear. Shear is factored out separately instead of being folded
+// into Scale, so a matrix that shears reports HasShear = true rather than
+// returning a distorted Scale.
+typedef struct HMM_Mat4Decomp
+{
+    HMM_Vec3 Translation;
+    HMM_Quat Rotation;
+    HMM_Vec3 Scale;
+    HMM_Vec3 Shear;    /* XY, XZ, YZ shear factors; all zero when there is no shear */
+    HMM_Bool HasShear; /* true when any shear factor is non-negligible */
+} HMM_Mat4Decomp;
+
+// Decomposes the affine transform M into translation, rotation, scale, and
+// shear (see HMM_Mat4Decomp for the exact convention). Perspective terms are
+// not supported; M is assumed to be affine with a bottom row of (0, 0, 0, 1).
+//
+// Returns true on success. Returns false when M is degenerate (its 3x3 linear
+// part is singular or nearly singular, i.e. its determinant is approximately
+// zero, such as a zero scale on any axis); in that case Result is zeroed out
+// and no component should be considered meaningful.
+static inline HMM_Bool HMM_DecomposeM4(HMM_Mat4 M, HMM_Mat4Decomp *Result)
+{
+    const float ScaleEpsilon = 1.0e-6f;
+    const float ShearEpsilon = 1.0e-4f;
+
+    HMM_Mat4Decomp D;
+    D.Translation = HMM_V3(0.0f, 0.0f, 0.0f);
+    D.Rotation = HMM_Q(0.0f, 0.0f, 0.0f, 1.0f);
+    D.Scale = HMM_V3(0.0f, 0.0f, 0.0f);
+    D.Shear = HMM_V3(0.0f, 0.0f, 0.0f);
+    D.HasShear = 0;
+
+    /* Factor the 3x3 linear part A into R * (Sh * S) by Gram-Schmidt on the
+     * columns of A: since Sh * S is upper triangular, this is exactly the QR
+     * decomposition A = Q * U with Q = R and U = Sh * S. */
+    HMM_Vec3 C0 = M.Columns[0].XYZ;
+    HMM_Vec3 C1 = M.Columns[1].XYZ;
+    HMM_Vec3 C2 = M.Columns[2].XYZ;
+
+    float SX = HMM_LenV3(C0);
+    if (SX < ScaleEpsilon) {
+        *Result = D;
+        return 0;
+    }
+    HMM_Vec3 Q0 = HMM_MulV3F(C0, 1.0f / SX);
+
+    float U01 = HMM_DotV3(Q0, C1);
+    HMM_Vec3 R1 = HMM_SubV3(C1, HMM_MulV3F(Q0, U01));
+    float SY = HMM_LenV3(R1);
+    if (SY < ScaleEpsilon) {
+        *Result = D;
+        return 0;
+    }
+    HMM_Vec3 Q1 = HMM_MulV3F(R1, 1.0f / SY);
+
+    float U02 = HMM_DotV3(Q0, C2);
+    float U12 = HMM_DotV3(Q1, C2);
+    HMM_Vec3 R2 = HMM_SubV3(HMM_SubV3(C2, HMM_MulV3F(Q0, U02)), HMM_MulV3F(Q1, U12));
+    float SZ = HMM_LenV3(R2);
+    if (SZ < ScaleEpsilon) {
+        *Result = D;
+        return 0;
+    }
+    HMM_Vec3 Q2 = HMM_MulV3F(R2, 1.0f / SZ);
+
+    /* A reflection (negative determinant) cannot be represented by a
+     * rotation; fold it into the X scale so R stays a proper rotation. */
+    if (HMM_DotV3(HMM_Cross(Q0, Q1), Q2) < 0.0f) {
+        SX = -SX;
+        Q0 = HMM_MulV3F(Q0, -1.0f);
+    }
+
+    /* U = Sh * S, so the off-diagonal entries of U are the shear factors
+     * premultiplied by the scale of their column. */
+    D.Shear = HMM_V3(U01 / SY, U02 / SZ, U12 / SZ);
+    D.Scale = HMM_V3(SX, SY, SZ);
+    D.Translation = M.Columns[3].XYZ;
+
+    if (D.Shear.X > ShearEpsilon || D.Shear.X < -ShearEpsilon ||
+        D.Shear.Y > ShearEpsilon || D.Shear.Y < -ShearEpsilon ||
+        D.Shear.Z > ShearEpsilon || D.Shear.Z < -ShearEpsilon) {
+        D.HasShear = 1;
+    }
+
+    HMM_Mat4 Rot = HMM_M4D(1.0f);
+    Rot.Columns[0].XYZ = Q0;
+    Rot.Columns[1].XYZ = Q1;
+    Rot.Columns[2].XYZ = Q2;
+    D.Rotation = HMM_M4ToQ_RH(Rot);
+
+    *Result = D;
+    return 1;
+}
+
+// Recomposes translation, rotation, scale, and shear components produced by
+// HMM_DecomposeM4 back into a 4x4 matrix, as T * R * Sh * S.
+static inline HMM_Mat4 HMM_ComposeM4(HMM_Mat4Decomp D)
+{
+    HMM_Mat4 Shear = HMM_M4D(1.0f);
+    Shear.Elements[1][0] = D.Shear.X;
+    Shear.Elements[2][0] = D.Shear.Y;
+    Shear.Elements[2][1] = D.Shear.Z;
+
+    HMM_Mat4 Result = HMM_MulM4(HMM_Translate(D.Translation), HMM_QToM4(D.Rotation));
+    Result = HMM_MulM4(Result, Shear);
+    Result = HMM_MulM4(Result, HMM_Scale(D.Scale));
+
+    return Result;
+}
 
 #ifdef __cplusplus
 }
