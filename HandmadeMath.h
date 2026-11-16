@@ -2089,6 +2089,358 @@ static inline HMM_Mat4 HMM_InvLookAt(HMM_Mat4 Matrix)
 }
 
 /*
+ * Singular value decomposition (SVD)
+ *
+ * Computes A = U * diag(S) * V^T for square matrices, useful for
+ * extracting bone stretch/deformation from transformation matrices.
+ * The decomposition forms B = A^T A, computes the symmetric eigen-
+ * decomposition of B with cyclic Jacobi sweeps to obtain the right
+ * singular vectors V, then recovers the singular values S = sqrt(eig(B))
+ * and the left singular vectors U = A * V / S. Singular values are
+ * returned in descending order. For rank-deficient inputs (zero
+ * singular values) the corresponding columns of U are completed to an
+ * orthonormal basis via modified Gram-Schmidt.
+ *
+ * The number of Jacobi sweeps (MaxIterations) and the convergence
+ * threshold (Tolerance) are configurable. All functions return
+ * HMM_SVD_OK (0) on success or a negative error code on failure.
+ */
+
+typedef struct HMM_SVD3
+{
+    HMM_Mat3 U;
+    HMM_Vec3 S;
+    HMM_Mat3 V;
+} HMM_SVD3;
+
+typedef struct HMM_SVD4
+{
+    HMM_Mat4 U;
+    HMM_Vec4 S;
+    HMM_Mat4 V;
+} HMM_SVD4;
+
+#define HMM_SVD_OK 0
+#define HMM_SVD_ERR_EMPTY (-1)      /* empty matrix (dimension <= 0) */
+#define HMM_SVD_ERR_INVALID (-2)    /* NULL argument or bad parameters */
+#define HMM_SVD_ERR_NONFINITE (-3)  /* NaN or Inf in the input matrix */
+#define HMM_SVD_ERR_ASYMMETRIC (-4) /* A^T A intermediate is not symmetric */
+#define HMM_SVD_ERR_NO_CONVERGE (-5)/* Jacobi iteration did not converge */
+#define HMM_SVD_ERR_DEGENERATE (-6) /* could not build an orthonormal basis */
+
+/* Cyclic Jacobi eigen decomposition of a symmetric N x N column-major
+   matrix B (destroyed in place). Eigenvectors are returned as columns of
+   Eigenvectors, eigenvalues in Eigenvalues. Internal helper. */
+static inline int HMM__SVDEigenSymmetric(float *B, int N, int MaxIterations, float Tolerance, float *Eigenvalues, float *Eigenvectors)
+{
+    int i, j, p, q, Sweep;
+
+    for (j = 0; j < N; ++j)
+    {
+        for (i = 0; i < N; ++i)
+        {
+            Eigenvectors[i + j * N] = (i == j) ? 1.0f : 0.0f;
+        }
+    }
+
+    for (Sweep = 0; Sweep < MaxIterations; ++Sweep)
+    {
+        float Off = 0.0f;
+        float DiagScale = 0.0f;
+
+        for (p = 0; p < N; ++p)
+        {
+            for (q = p + 1; q < N; ++q)
+            {
+                Off += B[p + q * N] * B[p + q * N];
+            }
+            DiagScale += B[p + p * N] * B[p + p * N];
+        }
+        Off = HMM_SQRTF(2.0f * Off);
+        DiagScale = HMM_SQRTF(DiagScale);
+
+        if (Off <= Tolerance * (DiagScale > 1.0f ? DiagScale : 1.0f))
+        {
+            break;
+        }
+
+        for (p = 0; p < N - 1; ++p)
+        {
+            for (q = p + 1; q < N; ++q)
+            {
+                float App = B[p + p * N];
+                float Aqq = B[q + q * N];
+                float Apq = B[p + q * N];
+
+                if (Apq != 0.0f)
+                {
+                    float Theta = (Aqq - App) / (2.0f * Apq);
+                    float T = ((Theta >= 0.0f) ? 1.0f : -1.0f) /
+                        (HMM_ABS(Theta) + HMM_SQRTF(Theta * Theta + 1.0f));
+                    float C = 1.0f / HMM_SQRTF(T * T + 1.0f);
+                    float S = T * C;
+
+                    for (i = 0; i < N; ++i)
+                    {
+                        float Bip = B[i + p * N];
+                        float Biq = B[i + q * N];
+                        B[i + p * N] = C * Bip - S * Biq;
+                        B[i + q * N] = S * Bip + C * Biq;
+                    }
+                    for (i = 0; i < N; ++i)
+                    {
+                        float Bpi = B[p + i * N];
+                        float Bqi = B[q + i * N];
+                        B[p + i * N] = C * Bpi - S * Bqi;
+                        B[q + i * N] = S * Bpi + C * Bqi;
+                    }
+                    for (i = 0; i < N; ++i)
+                    {
+                        float Vip = Eigenvectors[i + p * N];
+                        float Viq = Eigenvectors[i + q * N];
+                        Eigenvectors[i + p * N] = C * Vip - S * Viq;
+                        Eigenvectors[i + q * N] = S * Vip + C * Viq;
+                    }
+                }
+            }
+        }
+    }
+
+    if (Sweep >= MaxIterations)
+    {
+        return HMM_SVD_ERR_NO_CONVERGE;
+    }
+
+    for (i = 0; i < N; ++i)
+    {
+        Eigenvalues[i] = B[i + i * N];
+    }
+
+    return HMM_SVD_OK;
+}
+
+/* Orthonormalizes column Col of the column-major N x N matrix U against
+   columns 0..Col-1 using modified Gram-Schmidt. Internal helper. */
+static inline void HMM__SVDOrthogonalizeColumn(float *U, int N, int Col)
+{
+    int Pass, j, i;
+
+    for (Pass = 0; Pass < 2; ++Pass)
+    {
+        for (j = 0; j < Col; ++j)
+        {
+            float Dot = 0.0f;
+            for (i = 0; i < N; ++i)
+            {
+                Dot += U[i + j * N] * U[i + Col * N];
+            }
+            for (i = 0; i < N; ++i)
+            {
+                U[i + Col * N] -= Dot * U[i + j * N];
+            }
+        }
+    }
+}
+
+/* Shared SVD core for square matrices up to 4x4, column-major. Internal
+   helper; use HMM_SVDM3 / HMM_SVDM4 instead. */
+static inline int HMM__SVDCore(const float *A, int N, int MaxIterations, float Tolerance, float *OutU, float *OutS, float *OutV)
+{
+    float B[16];
+    float Eigenvectors[16];
+    float Eigenvalues[4];
+    float ZeroThreshold;
+    int i, j, k, Status;
+
+    if (A == 0 || OutU == 0 || OutS == 0 || OutV == 0)
+    {
+        return HMM_SVD_ERR_INVALID;
+    }
+    if (N <= 0 || N > 4)
+    {
+        return HMM_SVD_ERR_EMPTY;
+    }
+    if (MaxIterations <= 0 || Tolerance < 0.0f)
+    {
+        return HMM_SVD_ERR_INVALID;
+    }
+
+    for (i = 0; i < N * N; ++i)
+    {
+        float Diff = A[i] - A[i];
+        if (Diff != 0.0f)
+        {
+            return HMM_SVD_ERR_NONFINITE;
+        }
+    }
+
+    /* B = A^T A (symmetric intermediate) */
+    for (j = 0; j < N; ++j)
+    {
+        for (i = 0; i < N; ++i)
+        {
+            float Sum = 0.0f;
+            for (k = 0; k < N; ++k)
+            {
+                Sum += A[k + i * N] * A[k + j * N];
+            }
+            B[i + j * N] = Sum;
+        }
+    }
+
+    /* sanity-check the symmetric intermediate */
+    for (j = 0; j < N; ++j)
+    {
+        for (i = j + 1; i < N; ++i)
+        {
+            float Bij = B[i + j * N];
+            float Bji = B[j + i * N];
+            float D1 = Bij - Bij;
+            float D2 = Bji - Bji;
+            float Skew = HMM_ABS(Bij - Bji);
+            float Scale = HMM_ABS(Bij) + HMM_ABS(Bji) + 1.0f;
+            if (D1 != 0.0f || D2 != 0.0f)
+            {
+                return HMM_SVD_ERR_NONFINITE;
+            }
+            if (Skew > 1e-4f * Scale)
+            {
+                return HMM_SVD_ERR_ASYMMETRIC;
+            }
+        }
+    }
+
+    Status = HMM__SVDEigenSymmetric(B, N, MaxIterations, Tolerance, Eigenvalues, Eigenvectors);
+    if (Status != HMM_SVD_OK)
+    {
+        return Status;
+    }
+
+    /* singular values, sorted descending along with the columns of V */
+    for (i = 0; i < N; ++i)
+    {
+        OutS[i] = Eigenvalues[i] > 0.0f ? HMM_SQRTF(Eigenvalues[i]) : 0.0f;
+    }
+    for (i = 0; i < N; ++i)
+    {
+        int Best = i;
+        for (j = i + 1; j < N; ++j)
+        {
+            if (OutS[j] > OutS[Best])
+            {
+                Best = j;
+            }
+        }
+        if (Best != i)
+        {
+            float Tmp = OutS[i];
+            OutS[i] = OutS[Best];
+            OutS[Best] = Tmp;
+            for (k = 0; k < N; ++k)
+            {
+                float TmpV = Eigenvectors[k + i * N];
+                Eigenvectors[k + i * N] = Eigenvectors[k + Best * N];
+                Eigenvectors[k + Best * N] = TmpV;
+            }
+        }
+    }
+    for (i = 0; i < N * N; ++i)
+    {
+        OutV[i] = Eigenvectors[i];
+    }
+
+    /* left singular vectors: u_i = A v_i / sigma_i for nonzero sigmas */
+    ZeroThreshold = (Tolerance > 0.0f ? Tolerance : 1e-6f) * OutS[0];
+    for (j = 0; j < N; ++j)
+    {
+        float Norm = 0.0f;
+
+        if (OutS[j] > ZeroThreshold)
+        {
+            for (i = 0; i < N; ++i)
+            {
+                float Sum = 0.0f;
+                for (k = 0; k < N; ++k)
+                {
+                    Sum += A[i + k * N] * OutV[k + j * N];
+                }
+                OutU[i + j * N] = Sum / OutS[j];
+            }
+            HMM__SVDOrthogonalizeColumn(OutU, N, j);
+            for (i = 0; i < N; ++i)
+            {
+                Norm += OutU[i + j * N] * OutU[i + j * N];
+            }
+            Norm = HMM_SQRTF(Norm);
+        }
+
+        if (Norm > 1e-6f)
+        {
+            for (i = 0; i < N; ++i)
+            {
+                OutU[i + j * N] /= Norm;
+            }
+        }
+        else
+        {
+            /* zero singular value: complete U to an orthonormal basis */
+            int Found = 0;
+            for (k = 0; k < N && !Found; ++k)
+            {
+                float CandidateNorm;
+                for (i = 0; i < N; ++i)
+                {
+                    OutU[i + j * N] = (i == k) ? 1.0f : 0.0f;
+                }
+                HMM__SVDOrthogonalizeColumn(OutU, N, j);
+                CandidateNorm = 0.0f;
+                for (i = 0; i < N; ++i)
+                {
+                    CandidateNorm += OutU[i + j * N] * OutU[i + j * N];
+                }
+                CandidateNorm = HMM_SQRTF(CandidateNorm);
+                if (CandidateNorm > 1e-6f)
+                {
+                    for (i = 0; i < N; ++i)
+                    {
+                        OutU[i + j * N] /= CandidateNorm;
+                    }
+                    Found = 1;
+                }
+            }
+            if (!Found)
+            {
+                return HMM_SVD_ERR_DEGENERATE;
+            }
+        }
+    }
+
+    return HMM_SVD_OK;
+}
+
+static inline int HMM_SVDM3(HMM_Mat3 A, int MaxIterations, float Tolerance, HMM_SVD3 *Out)
+{
+    if (Out == 0)
+    {
+        return HMM_SVD_ERR_INVALID;
+    }
+
+    return HMM__SVDCore(&A.Elements[0][0], 3, MaxIterations, Tolerance,
+        &Out->U.Elements[0][0], &Out->S.Elements[0], &Out->V.Elements[0][0]);
+}
+
+static inline int HMM_SVDM4(HMM_Mat4 A, int MaxIterations, float Tolerance, HMM_SVD4 *Out)
+{
+    if (Out == 0)
+    {
+        return HMM_SVD_ERR_INVALID;
+    }
+
+    return HMM__SVDCore(&A.Elements[0][0], 4, MaxIterations, Tolerance,
+        &Out->U.Elements[0][0], &Out->S.Elements[0], &Out->V.Elements[0][0]);
+}
+
+/*
  * Quaternion operations
  */
 
