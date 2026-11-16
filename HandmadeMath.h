@@ -2400,6 +2400,368 @@ static inline HMM_Quat HMM_SLerp(HMM_Quat Left, float Time, HMM_Quat Right)
     return Result;
 }
 
+/*
+ * Quaternion spline operations
+ *
+ * HMM_QuatSpline interpolates a sequence of control rotations (unit
+ * quaternions) reached at the given knot times. Each segment follows the
+ * spherical (SLerp) path between its two surrounding control rotations and
+ * adds a tangent correction on top of it:
+ *
+ *   Q(u) = Left * Exp(u*D) * Exp(G(u))
+ *   G(u) = TangentScale * (A*u*(1-u)^2 + B*u^2*(1-u))
+ *   A = Duration*T[i] - D,   B = D - Duration*T[i+1]
+ *
+ * where u is the segment-local parameter in [0, 1], Duration is the segment
+ * length in time, D = Log(Left^-1 * Right) is the relative rotation, and T[i]
+ * is the angular velocity estimated at knot i. Since G(0) = G(1) = 0, the
+ * curve passes exactly through the two surrounding control rotations. As
+ *
+ *   d/du u*(1-u)^2 = 1   at u = 0,   d/du u^2*(1-u) = -1   at u = 1,
+ *
+ * the body-frame angular velocity at the segment ends is exactly T[i] and
+ * T[i+1]. Both segments meeting at an interior knot use the same T[i], so the
+ * angular velocity is continuous across every knot. The estimated velocities
+ * are central differences of the neighboring control rotations, expressed in
+ * the tangent space of the knot:
+ *
+ *   T[i] = (Log(Keys[i]^-1 * Keys[i+1]) - Log(Keys[i]^-1 * Keys[i-1]))
+ *          / (Times[i+1] - Times[i-1])                  (interior knots)
+ *
+ * with one-sided differences at the first and last knot. If the control points
+ * come from a constant angular velocity, every estimated T[i] equals that
+ * velocity and the spline reproduces it exactly.
+ *
+ * TangentScale scales the tangent correction:
+ *   0 -> plain per-segment SLerp (only C0 at the knots)
+ *   1 -> the curve matches the estimated knot velocities, so the angular
+ *        velocity is continuous at every knot (C1)
+ *   0 < TangentScale < 1 blends the two. The curve is still smooth and still
+ *   passes through every control rotation, but a knot's two segments agree on
+ *   its velocity only at TangentScale = 1.
+ * Values outside [0, 1] are allowed and exaggerate or relax the tangents.
+ *
+ * Segments: the spline has Count - 1 segments, one per pair of control points,
+ * so the segment count follows the number of control points.
+ * HMM_QuatSplineEvalUniform divides the whole time span into an explicitly
+ * given number of equal sub-intervals, making the sampled segment count
+ * configurable independently of the control points.
+ *
+ * The spline references the key and time arrays instead of copying them, so
+ * they must outlive it. No memory is allocated and evaluation is a pure
+ * function of the spline contents. Keys must be unit quaternions and Times
+ * must be finite and strictly increasing. Neighboring keys must be less than a
+ * half turn apart.
+ *
+ * Error handling: HMM_QuatSplineInit, HMM_QuatSplineEval,
+ * HMM_QuatSplineEvalSegment and HMM_QuatSplineEvalUniform return a non-zero
+ * HMM_Bool on success. They return 0 (leaving *Result untouched) on invalid
+ * input: a NULL pointer, fewer than 2 control points, non-finite or
+ * non-increasing times, a non-finite tangent scale, a segment index out of
+ * range, a local parameter outside [0, 1], or a time outside the spline's
+ * domain. NaN is rejected as out of range.
+ */
+typedef struct HMM_QuatSpline
+{
+    const HMM_Quat *Keys;   /* Count unit control quaternions */
+    const float *Times;     /* Count strictly increasing knot times */
+    int Count;              /* Number of control points; segments = Count - 1 */
+    float TangentScale;     /* Tangent correction scale, normally in [0, 1] */
+} HMM_QuatSpline;
+
+/* Logarithmic map of a unit quaternion to a rotation vector (axis * angle), in
+   the angle unit configured for the library. The shorter arc is taken, so the
+   result lies in the half-open ball of radius pi. */
+static inline HMM_Vec3 _HMM_QuatLog(HMM_Quat Quat)
+{
+    HMM_Vec3 Vector;
+    float Length;
+    float Angle;
+
+    Quat = HMM_NormQ(Quat);
+
+    /* NOTE: Q and -Q denote the same rotation; pick the shorter arc. */
+    if (Quat.W < 0.0f)
+    {
+        Quat = HMM_Q(-Quat.X, -Quat.Y, -Quat.Z, -Quat.W);
+    }
+
+    Vector = Quat.XYZ;
+    Length = HMM_LenV3(Vector);
+
+    if (Length > 0.0f)
+    {
+        Angle = 2.0f * HMM_ACosF(HMM_Clamp(-1.0f, Quat.W, 1.0f));
+        Vector = HMM_MulV3F(Vector, Angle / Length);
+    }
+
+    return Vector;
+}
+
+/* Exponential map of a rotation vector back to a unit quaternion. */
+static inline HMM_Quat _HMM_QuatExp(HMM_Vec3 Vector)
+{
+    float Angle;
+    float Scale;
+
+    Angle = HMM_LenV3(Vector);
+    Scale = 0.5f;
+
+    if (Angle > 0.0f)
+    {
+        Scale = HMM_SinF(Angle * 0.5f) / Angle;
+    }
+
+    return HMM_Q(Vector.X * Scale, Vector.Y * Scale, Vector.Z * Scale,
+                 HMM_CosF(Angle * 0.5f));
+}
+
+/* Checks that a spline is usable. Returns non-zero when it is. */
+static inline HMM_Bool _HMM_QuatSplineValid(const HMM_QuatSpline *Spline)
+{
+    int Index;
+
+    if (Spline == 0 || Spline->Keys == 0 || Spline->Times == 0)
+    {
+        return 0;
+    }
+
+    if (Spline->Count < 2)
+    {
+        return 0;
+    }
+
+    /* NOTE: x - x is zero only for finite x, so this rejects NaN and infinity
+       without depending on <float.h> or isnan. */
+    if ((Spline->TangentScale - Spline->TangentScale) != 0.0f)
+    {
+        return 0;
+    }
+
+    for (Index = 0; Index < Spline->Count; Index++)
+    {
+        if ((Spline->Times[Index] - Spline->Times[Index]) != 0.0f)
+        {
+            return 0;
+        }
+    }
+
+    for (Index = 1; Index < Spline->Count; Index++)
+    {
+        if (!(Spline->Times[Index] > Spline->Times[Index - 1]))
+        {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+/* Angular velocity estimated at a knot, expressed in the body frame of that
+   knot. The caller must have validated the spline. */
+static inline HMM_Vec3 _HMM_QuatSplineVelocity(const HMM_QuatSpline *Spline, int Index)
+{
+    HMM_Quat Key;
+    HMM_Vec3 Result;
+
+    Key = HMM_NormQ(Spline->Keys[Index]);
+
+    if (Index == 0)
+    {
+        HMM_Quat Next = HMM_NormQ(Spline->Keys[1]);
+
+        Result = _HMM_QuatLog(HMM_MulQ(HMM_InvQ(Key), Next));
+        Result = HMM_MulV3F(Result, 1.0f / (Spline->Times[1] - Spline->Times[0]));
+    }
+    else if (Index == Spline->Count - 1)
+    {
+        HMM_Quat Prev = HMM_NormQ(Spline->Keys[Index - 1]);
+
+        Result = _HMM_QuatLog(HMM_MulQ(HMM_InvQ(Key), Prev));
+        Result = HMM_MulV3F(Result, 1.0f / (Spline->Times[Index - 1] - Spline->Times[Index]));
+    }
+    else
+    {
+        HMM_Quat Prev = HMM_NormQ(Spline->Keys[Index - 1]);
+        HMM_Quat Next = HMM_NormQ(Spline->Keys[Index + 1]);
+        HMM_Vec3 Forward = _HMM_QuatLog(HMM_MulQ(HMM_InvQ(Key), Next));
+        HMM_Vec3 Backward = _HMM_QuatLog(HMM_MulQ(HMM_InvQ(Key), Prev));
+
+        Result = HMM_MulV3F(HMM_SubV3(Forward, Backward),
+                            1.0f / (Spline->Times[Index + 1] - Spline->Times[Index - 1]));
+    }
+
+    return Result;
+}
+
+/* Initializes a spline over Count control rotations. Returns non-zero on
+   success, zero (leaving *Spline untouched) on invalid input. */
+static inline HMM_Bool HMM_QuatSplineInit(HMM_QuatSpline *Spline, const HMM_Quat *Keys,
+                                          const float *Times, int Count, float TangentScale)
+{
+    HMM_QuatSpline Candidate;
+
+    if (Spline == 0)
+    {
+        return 0;
+    }
+
+    Candidate.Keys = Keys;
+    Candidate.Times = Times;
+    Candidate.Count = Count;
+    Candidate.TangentScale = TangentScale;
+
+    if (!_HMM_QuatSplineValid(&Candidate))
+    {
+        return 0;
+    }
+
+    *Spline = Candidate;
+    return 1;
+}
+
+/* Evaluates one segment at local parameter U in [0, 1]. Returns non-zero on
+   success, zero (leaving *Result untouched) on invalid input. */
+static inline HMM_Bool HMM_QuatSplineEvalSegment(const HMM_QuatSpline *Spline, int Segment,
+                                                 float U, HMM_Quat *Result)
+{
+    HMM_Quat Left;
+    HMM_Quat Right;
+    HMM_Vec3 Difference;
+    HMM_Vec3 Begin;
+    HMM_Vec3 End;
+    HMM_Vec3 Correction;
+    float Duration;
+    float Scale;
+
+    if (Result == 0 || !_HMM_QuatSplineValid(Spline))
+    {
+        return 0;
+    }
+
+    if (Segment < 0 || Segment >= Spline->Count - 1)
+    {
+        return 0;
+    }
+
+    if (!(U >= 0.0f) || !(U <= 1.0f))
+    {
+        return 0;
+    }
+
+    Left = Spline->Keys[Segment];
+    Right = Spline->Keys[Segment + 1];
+
+    /* NOTE: Reproduce the control rotations exactly at the segment ends. */
+    if (U <= 0.0f)
+    {
+        *Result = Left;
+        return 1;
+    }
+
+    if (U >= 1.0f)
+    {
+        *Result = Right;
+        return 1;
+    }
+
+    Duration = Spline->Times[Segment + 1] - Spline->Times[Segment];
+    Difference = _HMM_QuatLog(HMM_MulQ(HMM_InvQ(Left), Right));
+    Scale = Spline->TangentScale;
+
+    /* Along Q(u) = Left*Exp(u*D)*Exp(G), differentiating gives the body-frame
+       angular velocity as Ad(Exp(-G)) * D + G'(u), where Ad is a rotation of
+       the vector. Since G(0) = G(1) = 0, the adjoint is the identity at both
+       ends, and with G'(0) = Begin and G'(1) = -End the velocity there is
+       D + Begin and D - End. Choosing Begin = Duration*T[i] - D and
+       End = D - Duration*T[i+1] makes those equal to the knot velocities
+       T[i] and T[i+1], both expressed in the frame of the respective control
+       rotation. */
+    Begin = HMM_SubV3(HMM_MulV3F(_HMM_QuatSplineVelocity(Spline, Segment), Duration), Difference);
+    End = HMM_SubV3(Difference,
+                    HMM_MulV3F(_HMM_QuatSplineVelocity(Spline, Segment + 1), Duration));
+
+    /* G vanishes at U = 0 and U = 1, so the segment still ends on the control
+       rotations even with a non-zero correction. */
+    Correction = HMM_AddV3(
+        HMM_MulV3F(Begin, U * (1.0f - U) * (1.0f - U)),
+        HMM_MulV3F(End, U * U * (1.0f - U)));
+    Correction = HMM_MulV3F(Correction, Scale);
+
+    *Result = HMM_NormQ(HMM_MulQ(
+        HMM_MulQ(Left, _HMM_QuatExp(HMM_MulV3F(Difference, U))),
+        _HMM_QuatExp(Correction)));
+
+    return 1;
+}
+
+/* Evaluates the spline at Time. Returns non-zero on success, zero (leaving
+   *Result untouched) when the spline is invalid or Time is outside
+   [Times[0], Times[Count-1]]. */
+static inline HMM_Bool HMM_QuatSplineEval(const HMM_QuatSpline *Spline, float Time, HMM_Quat *Result)
+{
+    int Segment;
+    float Duration;
+    float U;
+
+    if (Result == 0 || !_HMM_QuatSplineValid(Spline))
+    {
+        return 0;
+    }
+
+    /* NOTE: Positive comparisons so a NaN Time is rejected. */
+    if (!(Time >= Spline->Times[0]) || !(Time <= Spline->Times[Spline->Count - 1]))
+    {
+        return 0;
+    }
+
+    Segment = 0;
+    while (Segment < Spline->Count - 2 && Time > Spline->Times[Segment + 1])
+    {
+        Segment++;
+    }
+
+    Duration = Spline->Times[Segment + 1] - Spline->Times[Segment];
+    U = (Time - Spline->Times[Segment]) / Duration;
+
+    return HMM_QuatSplineEvalSegment(Spline, Segment, U, Result);
+}
+
+/* Evaluates the spline on an evenly spaced grid of Segments sub-intervals
+   spanning the whole time span: Index = 0 gives Times[0] and Index = Segments
+   gives Times[Count-1]. Returns non-zero on success, zero (leaving *Result
+   untouched) on invalid input. */
+static inline HMM_Bool HMM_QuatSplineEvalUniform(const HMM_QuatSpline *Spline, int Segments,
+                                                 int Index, HMM_Quat *Result)
+{
+    float Time;
+
+    if (Result == 0 || !_HMM_QuatSplineValid(Spline))
+    {
+        return 0;
+    }
+
+    if (Segments < 1 || Index < 0 || Index > Segments)
+    {
+        return 0;
+    }
+
+    Time = HMM_Lerp(Spline->Times[0], (float)Index / (float)Segments,
+                    Spline->Times[Spline->Count - 1]);
+
+    return HMM_QuatSplineEval(Spline, Time, Result);
+}
+
+/* Convenience wrapper that returns the identity rotation when the spline or
+   the time is invalid. */
+static inline HMM_Quat HMM_QuatSplineSample(const HMM_QuatSpline *Spline, float Time)
+{
+    HMM_Quat Result = HMM_Q(0.0f, 0.0f, 0.0f, 1.0f);
+    HMM_QuatSplineEval(Spline, Time, &Result);
+
+    return Result;
+}
+
 COVERAGE(HMM_QToM4, 1)
 static inline HMM_Mat4 HMM_QToM4(HMM_Quat Left)
 {
