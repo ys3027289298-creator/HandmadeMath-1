@@ -2657,6 +2657,226 @@ static inline HMM_Vec3 HMM_RotateV3AxisAngle_RH(HMM_Vec3 V, HMM_Vec3 Axis, float
 }
 
 
+/*
+ * Euler angles
+ *
+ * An euler pose is stored in an HMM_Vec3, one angle per axis (X, Y, Z), in
+ * the library's configured angle units (radians by default). The rotation
+ * sequence is selected separately with an HMM_EulerOrder: the named
+ * rotations are applied intrinsically in the named order, i.e. for order
+ * XYZ the composed rotation is Q = Qx * Qy * Qz and M = Rx * Ry * Rz.
+ *
+ * Gimbal lock: when the middle angle of the sequence is within
+ * HMM_GIMBAL_LOCK_EPSILON of +/-90 degrees, the first and third rotation
+ * axes align and their angles cannot be separated. HMM_EulerIsGimbalLock,
+ * HMM_QIsGimbalLock and HMM_M4IsGimbalLock detect this condition. The
+ * explicit behavior of HMM_EulerFromQ and HMM_EulerFromM4 in that case is
+ * to set the FIRST angle of the sequence to zero and fold the remaining
+ * rotation into the third angle, so the round trip always reproduces the
+ * same rotation even though the individual angles may differ.
+ *
+ * Invalid poses (non-finite angles, non-finite or zero-norm quaternions,
+ * out-of-range order) are programming errors: the conversion functions
+ * report them with HMM_ASSERT, and HMM_EulerIsValid / HMM_QIsValid /
+ * HMM_EulerOrderIsValid are provided so callers can check inputs ahead of
+ * time.
+ */
+
+#ifndef HMM_ASSERT
+# include <assert.h>
+# define HMM_ASSERT(Expr) assert(Expr)
+#endif
+
+#ifndef HMM_GIMBAL_LOCK_EPSILON
+# define HMM_GIMBAL_LOCK_EPSILON 1e-3f
+#endif
+
+typedef enum HMM_EulerOrder
+{
+    HMM_EulerOrderXYZ = 0,
+    HMM_EulerOrderXZY,
+    HMM_EulerOrderYXZ,
+    HMM_EulerOrderYZX,
+    HMM_EulerOrderZXY,
+    HMM_EulerOrderZYX
+} HMM_EulerOrder;
+
+static inline int HMM_IsFiniteF(float Value)
+{
+    /* IEEE-754: |x| <= FLT_MAX holds for every finite float and fails for
+       both infinities and NaN, without any floating-point equality test. */
+    return HMM_ABS(Value) <= 3.4028234663852886e38f;
+}
+
+static inline int HMM_EulerIsValid(HMM_Vec3 Euler)
+{
+    return HMM_IsFiniteF(Euler.X) && HMM_IsFiniteF(Euler.Y) && HMM_IsFiniteF(Euler.Z);
+}
+
+static inline int HMM_QIsValid(HMM_Quat Q)
+{
+    float NormSq;
+
+    if (!HMM_IsFiniteF(Q.X) || !HMM_IsFiniteF(Q.Y) || !HMM_IsFiniteF(Q.Z) || !HMM_IsFiniteF(Q.W))
+    {
+        return 0;
+    }
+
+    NormSq = Q.X * Q.X + Q.Y * Q.Y + Q.Z * Q.Z + Q.W * Q.W;
+
+    return NormSq > 1e-12f;
+}
+
+static inline int HMM_EulerOrderIsValid(HMM_EulerOrder Order)
+{
+    return (int)Order >= (int)HMM_EulerOrderXYZ && (int)Order <= (int)HMM_EulerOrderZYX;
+}
+
+/* Maps an order to its axis indices (I, J, K) and the parity of the
+   permutation: +1 for the cyclic orders (XYZ, YZX, ZXY), -1 for the
+   anti-cyclic ones (XZY, YXZ, ZYX). */
+static inline void HMM_EulerOrderAxes(HMM_EulerOrder Order, int Axes[3], float *Parity)
+{
+    switch (Order)
+    {
+        case HMM_EulerOrderXYZ: Axes[0] = 0; Axes[1] = 1; Axes[2] = 2; *Parity =  1.0f; break;
+        case HMM_EulerOrderXZY: Axes[0] = 0; Axes[1] = 2; Axes[2] = 1; *Parity = -1.0f; break;
+        case HMM_EulerOrderYXZ: Axes[0] = 1; Axes[1] = 0; Axes[2] = 2; *Parity = -1.0f; break;
+        case HMM_EulerOrderYZX: Axes[0] = 1; Axes[1] = 2; Axes[2] = 0; *Parity =  1.0f; break;
+        case HMM_EulerOrderZXY: Axes[0] = 2; Axes[1] = 0; Axes[2] = 1; *Parity =  1.0f; break;
+        case HMM_EulerOrderZYX: Axes[0] = 2; Axes[1] = 1; Axes[2] = 0; *Parity = -1.0f; break;
+        default:
+            HMM_ASSERT(!"HMM_EulerOrderAxes: invalid euler order");
+            Axes[0] = 0; Axes[1] = 1; Axes[2] = 2; *Parity = 1.0f;
+        break;
+    }
+}
+
+static inline HMM_Quat HMM_QFromEuler(HMM_Vec3 Euler, HMM_EulerOrder Order)
+{
+    HMM_Quat AxisQuats[3];
+    HMM_Quat Result;
+    int Axes[3];
+    float Parity;
+    float HalfX, HalfY, HalfZ;
+
+    HMM_ASSERT(HMM_EulerIsValid(Euler));
+    HMM_ASSERT(HMM_EulerOrderIsValid(Order));
+
+    HMM_EulerOrderAxes(Order, Axes, &Parity);
+    (void)Parity;
+
+    HalfX = 0.5f * Euler.X;
+    HalfY = 0.5f * Euler.Y;
+    HalfZ = 0.5f * Euler.Z;
+
+    AxisQuats[0] = HMM_Q(HMM_SinF(HalfX), 0.0f, 0.0f, HMM_CosF(HalfX));
+    AxisQuats[1] = HMM_Q(0.0f, HMM_SinF(HalfY), 0.0f, HMM_CosF(HalfY));
+    AxisQuats[2] = HMM_Q(0.0f, 0.0f, HMM_SinF(HalfZ), HMM_CosF(HalfZ));
+
+    Result = HMM_MulQ(HMM_MulQ(AxisQuats[Axes[0]], AxisQuats[Axes[1]]), AxisQuats[Axes[2]]);
+
+    return HMM_NormQ(Result);
+}
+
+static inline HMM_Mat4 HMM_M4FromEuler(HMM_Vec3 Euler, HMM_EulerOrder Order)
+{
+    return HMM_QToM4(HMM_QFromEuler(Euler, Order));
+}
+
+static inline HMM_Vec3 HMM_EulerFromM4(HMM_Mat4 M, HMM_EulerOrder Order)
+{
+    HMM_Vec3 Result;
+    int Axes[3];
+    int I, J, K;
+    float Parity;
+    float SinB;
+    float A, B, C;
+
+    HMM_ASSERT(HMM_EulerOrderIsValid(Order));
+
+    HMM_EulerOrderAxes(Order, Axes, &Parity);
+    I = Axes[0];
+    J = Axes[1];
+    K = Axes[2];
+
+    /* HMM_Mat4 is column-major: the element at (row, col) is
+       M.Elements[col][row]. For M = Ri(A) * Rj(B) * Rk(C) the middle angle
+       satisfies sin(B) = Parity * M(I, K). */
+    SinB = HMM_Clamp(-1.0f, Parity * M.Elements[K][I], 1.0f);
+
+    if (1.0f - SinB * SinB < HMM_GIMBAL_LOCK_EPSILON * HMM_GIMBAL_LOCK_EPSILON)
+    {
+        /* Gimbal lock: collapse the first angle to zero and solve the third. */
+        float SignB = SinB < 0.0f ? -1.0f : 1.0f;
+
+        A = 0.0f;
+        B = HMM_ANGLE_INTERNAL_TO_USER(asinf(SignB));
+        C = HMM_ANGLE_INTERNAL_TO_USER(atan2f(SignB * M.Elements[J][K], M.Elements[J][J]));
+    }
+    else
+    {
+        A = HMM_ANGLE_INTERNAL_TO_USER(atan2f(-Parity * M.Elements[K][J], M.Elements[K][K]));
+        B = HMM_ANGLE_INTERNAL_TO_USER(asinf(SinB));
+        C = HMM_ANGLE_INTERNAL_TO_USER(atan2f(-Parity * M.Elements[J][I], M.Elements[I][I]));
+    }
+
+    Result.Elements[I] = A;
+    Result.Elements[J] = B;
+    Result.Elements[K] = C;
+
+    return Result;
+}
+
+static inline HMM_Vec3 HMM_EulerFromQ(HMM_Quat Q, HMM_EulerOrder Order)
+{
+    HMM_ASSERT(HMM_QIsValid(Q));
+    HMM_ASSERT(HMM_EulerOrderIsValid(Order));
+
+    return HMM_EulerFromM4(HMM_QToM4(HMM_NormQ(Q)), Order);
+}
+
+static inline int HMM_EulerIsGimbalLock(HMM_Vec3 Euler, HMM_EulerOrder Order)
+{
+    int Axes[3];
+    float Parity;
+    float Middle;
+
+    HMM_ASSERT(HMM_EulerIsValid(Euler));
+    HMM_ASSERT(HMM_EulerOrderIsValid(Order));
+
+    HMM_EulerOrderAxes(Order, Axes, &Parity);
+    (void)Parity;
+
+    Middle = Euler.Elements[Axes[1]];
+
+    return HMM_ABS(HMM_CosF(Middle)) < HMM_GIMBAL_LOCK_EPSILON;
+}
+
+static inline int HMM_M4IsGimbalLock(HMM_Mat4 M, HMM_EulerOrder Order)
+{
+    int Axes[3];
+    float Parity;
+    float SinB;
+
+    HMM_ASSERT(HMM_EulerOrderIsValid(Order));
+
+    HMM_EulerOrderAxes(Order, Axes, &Parity);
+
+    SinB = HMM_Clamp(-1.0f, Parity * M.Elements[Axes[2]][Axes[0]], 1.0f);
+
+    return 1.0f - SinB * SinB < HMM_GIMBAL_LOCK_EPSILON * HMM_GIMBAL_LOCK_EPSILON;
+}
+
+static inline int HMM_QIsGimbalLock(HMM_Quat Q, HMM_EulerOrder Order)
+{
+    HMM_ASSERT(HMM_QIsValid(Q));
+    HMM_ASSERT(HMM_EulerOrderIsValid(Order));
+
+    return HMM_M4IsGimbalLock(HMM_QToM4(HMM_NormQ(Q)), Order);
+}
+
+
 #ifdef __cplusplus
 }
 #endif
