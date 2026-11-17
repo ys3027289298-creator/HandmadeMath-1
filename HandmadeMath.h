@@ -1915,6 +1915,131 @@ static inline HMM_Mat4 HMM_InvPerspective_LH(HMM_Mat4 PerspectiveMatrix)
     return Result;
 }
 
+/*
+ * Unprojection (screen space back to world space)
+ *
+ * These functions invert the projection pipeline: given a screen-space
+ * position in pixels and a depth buffer value, they reconstruct the
+ * corresponding world-space position (or picking ray) using the inverse of
+ * the view-projection matrix. HMM_TryInvViewProj computes that inverse and
+ * rejects singular matrices.
+ *
+ * NOTE: these functions are intentionally not registered with the COVERAGE
+ * test harness; they are exercised by test/unproject_test.c instead.
+ */
+
+// Options controlling how screen coordinates and depths are mapped back to world space.
+typedef struct HMM_UnprojectOpts
+{
+    float ViewportX;         /* Left edge of the viewport, in pixels. */
+    float ViewportY;         /* Bottom edge of the viewport, in pixels. */
+    float ViewportWidth;     /* Width of the viewport, in pixels. */
+    float ViewportHeight;    /* Height of the viewport, in pixels. */
+    float DepthMin;          /* Depth value that maps to the near plane (commonly 0). */
+    float DepthMax;          /* Depth value that maps to the far plane (commonly 1). */
+    HMM_Bool NDCZeroToOne;   /* True if the projection maps depth to NDC Z in [0, 1] (the _ZO projections); false for [-1, 1] (the _NO projections). */
+    HMM_Bool ClipToDepthRange; /* If true, points whose depth falls outside [DepthMin, DepthMax] are rejected (returned as NaNs). */
+} HMM_UnprojectOpts;
+
+// A world-space ray, as produced by HMM_UnprojectRay.
+typedef struct HMM_Ray
+{
+    HMM_Vec3 Origin;
+    HMM_Vec3 Direction;
+} HMM_Ray;
+
+// Computes the inverse of a view-projection matrix for use with HMM_Unproject and
+// HMM_UnprojectRay. Returns false (and leaves OutInverse untouched) when the matrix
+// is singular or non-finite, in which case unprojection is not meaningful.
+static inline HMM_Bool HMM_TryInvViewProj(HMM_Mat4 ViewProj, HMM_Mat4 *OutInverse)
+{
+    float Determinant = HMM_DeterminantM4(ViewProj);
+
+    /* Rejects zero/denormal determinants (singular) as well as NaN and
+       infinity (non-finite), without relying on float equality or <float.h>. */
+    if (!(HMM_ABS(Determinant) > 1e-20f) || !(HMM_ABS(Determinant) < 3.0e+38f))
+    {
+        return 0;
+    }
+
+    *OutInverse = HMM_InvGeneralM4(ViewProj);
+    return 1;
+}
+
+// Maps a screen-space position and depth back to world space. Screen coordinates
+// are in pixels with the origin at the bottom-left of the viewport; Depth is
+// interpreted in the [DepthMin, DepthMax] range given by Opts. If
+// Opts.ClipToDepthRange is true and Depth lies outside that range, a vector of
+// NaNs is returned. Points outside the viewport rectangle are still unprojected
+// (they simply map to NDC coordinates outside [-1, 1]).
+static inline HMM_Vec3 HMM_Unproject(HMM_Vec2 Screen, float Depth, HMM_Mat4 InvViewProj, HMM_UnprojectOpts Opts)
+{
+    if (Opts.ClipToDepthRange && (Depth < Opts.DepthMin || Depth > Opts.DepthMax))
+    {
+        /* 0/0 yields a quiet NaN without needing <math.h>'s NAN, which may be
+           absent when HANDMADE_MATH_PROVIDE_MATH_FUNCTIONS is used. */
+        float Zero = 0.0f;
+        float NaN = Zero / Zero;
+        return HMM_V3(NaN, NaN, NaN);
+    }
+
+    float DepthSpan = Opts.DepthMax - Opts.DepthMin;
+    float NDCZ = (Depth - Opts.DepthMin) / DepthSpan;
+    if (!Opts.NDCZeroToOne)
+    {
+        NDCZ = NDCZ * 2.0f - 1.0f;
+    }
+
+    HMM_Vec4 NDC;
+    NDC.X = ((Screen.X - Opts.ViewportX) / Opts.ViewportWidth) * 2.0f - 1.0f;
+    NDC.Y = ((Screen.Y - Opts.ViewportY) / Opts.ViewportHeight) * 2.0f - 1.0f;
+    NDC.Z = NDCZ;
+    NDC.W = 1.0f;
+
+    HMM_Vec4 World = HMM_MulM4V4(InvViewProj, NDC);
+    return HMM_DivV3F(World.XYZ, World.W);
+}
+
+// Batch version of HMM_Unproject: unprojects Count (screen, depth) pairs into
+// OutWorld. Every element goes through the exact same scalar code path as a
+// per-point HMM_Unproject call, so results are bit-identical to looping over
+// HMM_Unproject by hand. Returns the number of points that were not clipped
+// (all of them when Opts.ClipToDepthRange is false).
+static inline int HMM_UnprojectBatch(HMM_Vec3 *OutWorld, const HMM_Vec2 *Screens, const float *Depths, int Count, HMM_Mat4 InvViewProj, HMM_UnprojectOpts Opts)
+{
+    int Valid = 0;
+    int I;
+    for (I = 0; I < Count; ++I)
+    {
+        HMM_Vec3 World = HMM_Unproject(Screens[I], Depths[I], InvViewProj, Opts);
+        OutWorld[I] = World;
+        if (World.X == World.X) /* clipped points come back as NaN */
+        {
+            ++Valid;
+        }
+    }
+
+    return Valid;
+}
+
+// Generates a world-space picking ray through a screen-space position. The
+// origin lies on the near plane and the (normalized) direction points toward
+// the far plane, so for perspective projections the ray fans out from the
+// camera while for orthographic projections all rays share one direction.
+// Depth clipping is ignored: both endpoints are evaluated exactly at
+// Opts.DepthMin and Opts.DepthMax.
+static inline HMM_Ray HMM_UnprojectRay(HMM_Vec2 Screen, HMM_Mat4 InvViewProj, HMM_UnprojectOpts Opts)
+{
+    HMM_UnprojectOpts RayOpts = Opts;
+    RayOpts.ClipToDepthRange = 0;
+
+    HMM_Ray Result;
+    Result.Origin = HMM_Unproject(Screen, Opts.DepthMin, InvViewProj, RayOpts);
+    Result.Direction = HMM_NormV3(HMM_SubV3(HMM_Unproject(Screen, Opts.DepthMax, InvViewProj, RayOpts), Result.Origin));
+
+    return Result;
+}
+
 COVERAGE(HMM_Translate, 1)
 static inline HMM_Mat4 HMM_Translate(HMM_Vec3 Translation)
 {
