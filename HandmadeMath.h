@@ -2656,6 +2656,1289 @@ static inline HMM_Vec3 HMM_RotateV3AxisAngle_RH(HMM_Vec3 V, HMM_Vec3 Axis, float
     return HMM_RotateV3Q(V, HMM_QFromAxisAngle_RH(Axis, Angle));
 }
 
+/*
+  =============================================================================
+  3D QUICKHULL (HMM_QuickHull3)
+
+  Builds the convex hull of a point cloud in 3D instead of requiring the hull
+  vertices to be specified by hand. The algorithm:
+
+    1. Find the six axis-aligned extreme points and pick four non-degenerate
+       ones to build an initial tetrahedron.
+    2. Assign every point to the first face it can see (strictly outside,
+       beyond the tolerance). Points on a face (within the tolerance) are
+       recorded as coplanar points of that face.
+    3. Repeatedly take the farthest conflict point of a face, find the
+       horizon of the region of faces visible from it, delete the visible
+       faces, and cap the hole with new faces.
+    4. After no point remains outside any face, merge the coplanar points
+       onto the faces they lie on (optionally keeping them in the result).
+
+  Degenerate inputs (fewer than four distinct points, or all points coplanar/
+  collinear) are reported through the status field instead of crashing.
+
+  Everything below uses only C99 standard library facilities, so it compiles
+  as both C and C++98. All functions are static; none of the symbols above
+  this section are modified.
+  =============================================================================
+*/
+
+#include <stdlib.h>
+#include <string.h>
+
+/*
+  The Quickhull helpers are static inline like the rest of the library, so a
+  translation unit that never builds a hull would warn about unused
+  functions. Silence that warning for this section only.
+*/
+#if defined(__GNUC__) || defined(__clang__)
+# pragma GCC diagnostic push
+# pragma GCC diagnostic ignored "-Wunused-function"
+#endif
+
+/* Result status of a Quickhull run. */
+typedef enum HMM_HullStatus
+{
+    HMM_HULL_OK,
+    HMM_HULL_TOO_FEW_POINTS,    /* fewer than four distinct input points */
+    HMM_HULL_ALL_COPLANAR,      /* distinct points do not span a volume */
+    HMM_HULL_OUT_OF_MEMORY
+} HMM_HullStatus;
+
+/*
+  Configuration for HMM_QuickHull3.
+
+  Epsilon is the absolute point-to-plane tolerance. A negative value means
+  "pick one automatically": roughly one part in 1e5 of the point cloud's
+  bounding box diagonal.
+
+  KeepCoplanarPoints controls whether points lying on a hull face (within
+  Epsilon) are retained and returned through HMM_HullCoplanarCount /
+  HMM_HullCoplanarPoint. They are never counted as hull vertices.
+*/
+typedef struct HMM_HullOptions
+{
+    float Epsilon;
+    HMM_Bool KeepCoplanarPoints;
+} HMM_HullOptions;
+
+/* One triangular hull face. Indices index the compacted Points array. */
+typedef struct HMM_HullFace
+{
+    int Vertices[3];
+    int Neighbors[3]; /* face adjacent across the edge opposite Vertices[i] */
+    int Next;         /* internal linked list, -1 for none */
+} HMM_HullFace;
+
+/*
+  The convex hull result.
+
+  Points holds the distinct input points (duplicates removed). FaceCount
+  triangular faces index into Points. Coplanar points are returned per face
+  through HMM_HullCoplanarPoint. A failed run has Status != HMM_HULL_OK and
+  zero faces/volume; the struct may still be passed to HMM_FreeHull.
+*/
+typedef struct HMM_Hull
+{
+    HMM_HullStatus Status;
+    HMM_Vec3* Points;
+    int PointCount;       /* distinct points */
+    int InputCount;       /* points before duplicate removal */
+    HMM_HullFace* Faces;
+    int FaceCount;
+    float Epsilon;
+    HMM_Bool KeepCoplanarPoints;
+
+    /* Internal bookkeeping. */
+    int FaceCap;
+    int AllocCount;      /* slots ever allocated, bounds the free list */
+    int ActiveHead;       /* head of the active-face linked list */
+    int FreeHead;         /* head of the free-face slot linked list */
+    int* Conflicts;       /* per face: head of outside-point list */
+    int* Coplanar;        /* per face: head of on-face-point list */
+    int* PointNext;       /* per point: next index in a face point list */
+    int* PointOwner;      /* per point: owning face, -1 if unassigned */
+} HMM_Hull;
+
+static inline HMM_HullOptions HMM_DefaultHullOptions(void)
+{
+    HMM_HullOptions Result;
+    Result.Epsilon = -1.0f;
+    Result.KeepCoplanarPoints = 1;
+    return Result;
+}
+
+/* Read-only accessors for a hull result. */
+static inline HMM_HullStatus HMM_HullStatusOf(const HMM_Hull* Hull)
+{
+    return Hull->Status;
+}
+
+static inline int HMM_HullFaceCount(const HMM_Hull* Hull)
+{
+    return Hull->FaceCount;
+}
+
+static inline int HMM_HullVertexCount(const HMM_Hull* Hull)
+{
+    int Result = 0;
+    int* Used;
+    int I;
+
+    if (Hull->Status != HMM_HULL_OK || Hull->FaceCount == 0)
+    {
+        return 0;
+    }
+
+    Used = (int*) calloc((size_t) Hull->PointCount, sizeof(int));
+    if (Used == 0)
+    {
+        return 0;
+    }
+
+    for (I = 0; I < Hull->FaceCount; I++)
+    {
+        int V;
+        for (V = 0; V < 3; V++)
+        {
+            Used[Hull->Faces[I].Vertices[V]] = 1;
+        }
+    }
+
+    for (I = 0; I < Hull->PointCount; I++)
+    {
+        Result += Used[I];
+    }
+
+    free(Used);
+    return Result;
+}
+
+static inline int HMM_HullCoplanarCount(const HMM_Hull* Hull, int FaceIndex)
+{
+    int Count = 0;
+    int P;
+
+    if (Hull->Status != HMM_HULL_OK || FaceIndex < 0
+        || FaceIndex >= Hull->FaceCount || Hull->Coplanar == 0)
+    {
+        return 0;
+    }
+
+    P = Hull->Coplanar[FaceIndex];
+    while (P != -1)
+    {
+        Count++;
+        P = Hull->PointNext[P];
+    }
+    return Count;
+}
+
+static inline HMM_Vec3 HMM_HullCoplanarPoint(const HMM_Hull* Hull,
+                                             int FaceIndex, int PointIndex)
+{
+    int P;
+    int I;
+
+    if (Hull->Points != 0 && Hull->Coplanar != 0
+        && FaceIndex >= 0 && FaceIndex < Hull->FaceCount)
+    {
+        P = Hull->Coplanar[FaceIndex];
+        I = 0;
+        while (P != -1)
+        {
+            if (I == PointIndex)
+            {
+                return Hull->Points[P];
+            }
+            I++;
+            P = Hull->PointNext[P];
+        }
+    }
+
+    return HMM_V3(0.0f, 0.0f, 0.0f);
+}
+
+static inline HMM_Vec3 HMM_HullPoint(const HMM_Hull* Hull, int PointIndex)
+{
+    if (Hull->Points != 0 && PointIndex >= 0 && PointIndex < Hull->PointCount)
+    {
+        return Hull->Points[PointIndex];
+    }
+    return HMM_V3(0.0f, 0.0f, 0.0f);
+}
+
+static inline void HMM_HullFaceVertices(const HMM_Hull* Hull, int FaceIndex,
+                                        int OutVertices[3])
+{
+    if (FaceIndex >= 0 && FaceIndex < Hull->FaceCount)
+    {
+        OutVertices[0] = Hull->Faces[FaceIndex].Vertices[0];
+        OutVertices[1] = Hull->Faces[FaceIndex].Vertices[1];
+        OutVertices[2] = Hull->Faces[FaceIndex].Vertices[2];
+    }
+    else
+    {
+        OutVertices[0] = -1;
+        OutVertices[1] = -1;
+        OutVertices[2] = -1;
+    }
+}
+
+/*
+  Volume of the closed hull as a sum of signed tetrahedra from the origin.
+  The winding of the produced faces makes the signed sum positive, but an
+  absolute value is taken anyway. Returns zero for failed/degenerate runs.
+*/
+static inline float HMM_HullVolume(const HMM_Hull* Hull)
+{
+    float Sum = 0.0f;
+    int I;
+
+    if (Hull->Status != HMM_HULL_OK)
+    {
+        return 0.0f;
+    }
+
+    for (I = 0; I < Hull->FaceCount; I++)
+    {
+        HMM_Vec3 A = Hull->Points[Hull->Faces[I].Vertices[0]];
+        HMM_Vec3 B = Hull->Points[Hull->Faces[I].Vertices[1]];
+        HMM_Vec3 C = Hull->Points[Hull->Faces[I].Vertices[2]];
+        Sum += HMM_DotV3(A, HMM_Cross(B, C)) / 6.0f;
+    }
+
+    return Sum < 0.0f ? -Sum : Sum;
+}
+
+static inline void HMM_FreeHull(HMM_Hull* Hull)
+{
+    if (Hull == 0)
+    {
+        return;
+    }
+    free(Hull->Points);
+    free(Hull->Faces);
+    free(Hull->Conflicts);
+    free(Hull->Coplanar);
+    free(Hull->PointNext);
+    free(Hull->PointOwner);
+
+    Hull->Points = 0;
+    Hull->PointCount = 0;
+    Hull->Faces = 0;
+    Hull->FaceCount = 0;
+    Hull->Conflicts = 0;
+    Hull->Coplanar = 0;
+    Hull->PointNext = 0;
+    Hull->PointOwner = 0;
+}
+
+/* ---- Quickhull internals ------------------------------------------------ */
+
+static HMM_Bool HMM__HullPointEqual(const HMM_Vec3* A, const HMM_Vec3* B,
+                                    float Tol)
+{
+    float Dx = A->X - B->X;
+    float Dy = A->Y - B->Y;
+    float Dz = A->Z - B->Z;
+    return (Dx * Dx + Dy * Dy + Dz * Dz) <= Tol * Tol;
+}
+
+/*
+  Signed distance of P to the face plane. Faces are wound so that hull
+  interior points get a negative value. The normal is normalized so that the
+  result is an actual point-to-plane distance comparable to Epsilon.
+*/
+static float HMM__HullFaceDistance(const HMM_Hull* Hull, int FaceIndex,
+                                   const HMM_Vec3* P)
+{
+    const HMM_HullFace* F = &Hull->Faces[FaceIndex];
+    HMM_Vec3 A = Hull->Points[F->Vertices[0]];
+    HMM_Vec3 B = Hull->Points[F->Vertices[1]];
+    HMM_Vec3 C = Hull->Points[F->Vertices[2]];
+    HMM_Vec3 Normal = HMM_Cross(HMM_SubV3(B, A), HMM_SubV3(C, A));
+    float Len = HMM_LenV3(Normal);
+    if (Len <= 0.0f)
+    {
+        return 0.0f;
+    }
+    return HMM_DotV3(HMM_SubV3(*P, A), Normal) / Len;
+}
+
+static void HMM__HullAddConflict(HMM_Hull* Hull, int FaceIndex, int PointIndex)
+{
+    Hull->PointNext[PointIndex] = Hull->Conflicts[FaceIndex];
+    Hull->Conflicts[FaceIndex] = PointIndex;
+    Hull->PointOwner[PointIndex] = FaceIndex;
+}
+
+static void HMM__HullAddCoplanar(HMM_Hull* Hull, int FaceIndex, int PointIndex)
+{
+    Hull->PointNext[PointIndex] = Hull->Coplanar[FaceIndex];
+    Hull->Coplanar[FaceIndex] = PointIndex;
+    Hull->PointOwner[PointIndex] = FaceIndex;
+}
+
+static int HMM__HullAllocFace(HMM_Hull* Hull)
+{
+    int Index;
+
+    if (Hull->FreeHead != -1)
+    {
+        Index = Hull->FreeHead;
+        Hull->FreeHead = Hull->Faces[Index].Next;
+    }
+    else
+    {
+        /*
+          A hull of N vertices has at most 2N-4 faces; the initial FaceCap
+          is sized above that bound, so the free list should always supply a
+          slot. Refuse to grow past the capacity rather than overrun the
+          caller's scratch arrays.
+        */
+        if (Hull->AllocCount >= Hull->FaceCap)
+        {
+            return -1;
+        }
+        Index = Hull->AllocCount;
+        Hull->AllocCount++;
+    }
+
+    Hull->Faces[Index].Vertices[0] = -1;
+    Hull->Faces[Index].Vertices[1] = -1;
+    Hull->Faces[Index].Vertices[2] = -1;
+    Hull->Faces[Index].Neighbors[0] = -1;
+    Hull->Faces[Index].Neighbors[1] = -1;
+    Hull->Faces[Index].Neighbors[2] = -1;
+    Hull->Faces[Index].Next = -1;
+    Hull->Conflicts[Index] = -1;
+    Hull->Coplanar[Index] = -1;
+
+    /* Push onto the active cycle. */
+    if (Hull->ActiveHead == -1)
+    {
+        Hull->ActiveHead = Index;
+        Hull->Faces[Index].Next = Index;
+    }
+    else
+    {
+        int Tail = Hull->ActiveHead;
+        while (Hull->Faces[Tail].Next != Hull->ActiveHead)
+        {
+            Tail = Hull->Faces[Tail].Next;
+        }
+        Hull->Faces[Tail].Next = Index;
+        Hull->Faces[Index].Next = Hull->ActiveHead;
+    }
+
+    Hull->FaceCount++;
+    return Index;
+}
+
+/* Locate the edge (A,B) of a face; returns the local slot 0..2, or -1. */
+static int HMM__HullFindEdge(const HMM_Hull* Hull, int FaceIndex,
+                             int A, int B)
+{
+    const HMM_HullFace* F = &Hull->Faces[FaceIndex];
+    int I;
+    for (I = 0; I < 3; I++)
+    {
+        int U = F->Vertices[I];
+        int V = F->Vertices[(I + 1) % 3];
+        if (U == A && V == B)
+        {
+            return I;
+        }
+        if (U == B && V == A)
+        {
+            return I;
+        }
+    }
+    return -1;
+}
+
+/* Make two faces neighbors across their shared edge. */
+static void HMM__HullConnect(HMM_Hull* Hull, int FaceA, int FaceB)
+{
+    HMM_HullFace* A = &Hull->Faces[FaceA];
+    HMM_HullFace* B = &Hull->Faces[FaceB];
+    int I;
+
+    for (I = 0; I < 3; I++)
+    {
+        int U = A->Vertices[I];
+        int V = A->Vertices[(I + 1) % 3];
+        int Slot = HMM__HullFindEdge(Hull, FaceB, U, V);
+        if (Slot != -1)
+        {
+            A->Neighbors[I] = FaceB;
+            B->Neighbors[Slot] = FaceA;
+            return;
+        }
+    }
+}
+
+/*
+  Assign one point to a set of candidate faces. A point lying on one face's
+  plane may still be outside another face, so every face is tested before the
+  point is committed as a coplanar point.
+*/
+static void HMM__HullAssignPoint(HMM_Hull* Hull, int PointIndex,
+                                 const int* Faces, int FaceListCount,
+                                 float Epsilon)
+{
+    int I;
+    int CoplanarFace = -1;
+    HMM_Vec3 P = Hull->Points[PointIndex];
+
+    for (I = 0; I < FaceListCount; I++)
+    {
+        float D = HMM__HullFaceDistance(Hull, Faces[I], &P);
+        if (D > Epsilon)
+        {
+            HMM__HullAddConflict(Hull, Faces[I], PointIndex);
+            return;
+        }
+        if (CoplanarFace == -1 && D >= -Epsilon)
+        {
+            CoplanarFace = Faces[I];
+        }
+    }
+
+    if (CoplanarFace != -1)
+    {
+        HMM__HullAddCoplanar(Hull, CoplanarFace, PointIndex);
+    }
+    else
+    {
+        Hull->PointOwner[PointIndex] = -1; /* strictly inside, unassigned */
+    }
+}
+
+static HMM_Hull HMM__HullFail(HMM_HullStatus Status)
+{
+    HMM_Hull Result;
+    memset(&Result, 0, sizeof(Result));
+    Result.Status = Status;
+    Result.ActiveHead = -1;
+    Result.FreeHead = -1;
+    return Result;
+}
+
+/*
+  Build the convex hull of Count points. The returned hull always owns its
+  arrays; call HMM_FreeHull when done. See HMM_HullOptions for configuration.
+*/
+static HMM_Hull HMM_QuickHull3(const HMM_Vec3* Points, int Count,
+                               HMM_HullOptions Options)
+{
+    HMM_Hull Hull;
+    HMM_Vec3 MinP, MaxP;
+    float Diag;
+    float DupTol;
+    int I, J, K;
+    int UniqueCount;
+    int* Map;
+    int Extremes[6];
+    int Tetra[4];
+    int TetraFound;
+    int InitialFaces[4];
+    int* ActiveList;
+    int ActiveCount;
+    int* NewFaces;
+    int NewCount;
+    int* Queue;
+    unsigned char* Visited;
+    int* VisibleFaces;
+    int* HorizonFace;
+    int* HorizonSlot;
+    int* HorizonU;
+    int* HorizonV;
+    int* EdgeLo;
+    int* EdgeHi;
+    int* EdgeFace;
+    int* EdgeSlot;
+    int EdgeUsed;
+    int QueueHead, QueueTail;
+    HMM_HullStatus FailStatus = HMM_HULL_OK;
+
+    memset(&Hull, 0, sizeof(Hull));
+    Hull.Status = HMM_HULL_OK;
+    Hull.ActiveHead = -1;
+    Hull.FreeHead = -1;
+
+    if (Points == 0 || Count < 4)
+    {
+        return HMM__HullFail(HMM_HULL_TOO_FEW_POINTS);
+    }
+
+    /* Bounding box: drives both the automatic epsilon and dedup tolerance. */
+    MinP = Points[0];
+    MaxP = Points[0];
+    for (I = 1; I < Count; I++)
+    {
+        if (Points[I].X < MinP.X) MinP.X = Points[I].X;
+        if (Points[I].Y < MinP.Y) MinP.Y = Points[I].Y;
+        if (Points[I].Z < MinP.Z) MinP.Z = Points[I].Z;
+        if (Points[I].X > MaxP.X) MaxP.X = Points[I].X;
+        if (Points[I].Y > MaxP.Y) MaxP.Y = Points[I].Y;
+        if (Points[I].Z > MaxP.Z) MaxP.Z = Points[I].Z;
+    }
+    Diag = HMM_LenV3(HMM_SubV3(MaxP, MinP));
+    if (!(Diag > 0.0f))
+    {
+        /* All points coincide. */
+        return HMM__HullFail(HMM_HULL_TOO_FEW_POINTS);
+    }
+
+    Hull.Epsilon = Options.Epsilon >= 0.0f
+        ? Options.Epsilon : Diag * 1.0e-5f;
+    Hull.KeepCoplanarPoints = Options.KeepCoplanarPoints;
+    Hull.InputCount = Count;
+    DupTol = Diag * 1.0e-7f;
+
+    /* Remove duplicates into a compacted point array. */
+    Hull.Points = (HMM_Vec3*) malloc((size_t) Count * sizeof(HMM_Vec3));
+    Map = (int*) malloc((size_t) Count * sizeof(int));
+    if (Hull.Points == 0 || Map == 0)
+    {
+        free(Map);
+        HMM_FreeHull(&Hull);
+        return HMM__HullFail(HMM_HULL_OUT_OF_MEMORY);
+    }
+
+    UniqueCount = 0;
+    for (I = 0; I < Count; I++)
+    {
+        int Duplicate = 0;
+        for (J = 0; J < UniqueCount; J++)
+        {
+            if (HMM__HullPointEqual(&Points[I], &Hull.Points[J], DupTol))
+            {
+                Duplicate = 1;
+                Map[I] = J;
+                break;
+            }
+        }
+        if (!Duplicate)
+        {
+            Map[I] = UniqueCount;
+            Hull.Points[UniqueCount] = Points[I];
+            UniqueCount++;
+        }
+    }
+    free(Map);
+    Hull.PointCount = UniqueCount;
+
+    if (UniqueCount < 4)
+    {
+        HMM_FreeHull(&Hull);
+        return HMM__HullFail(HMM_HULL_TOO_FEW_POINTS);
+    }
+
+    Hull.PointNext = (int*) malloc((size_t) UniqueCount * sizeof(int));
+    Hull.PointOwner = (int*) malloc((size_t) UniqueCount * sizeof(int));
+    Hull.FaceCap = UniqueCount * 2 + 16;
+    Hull.AllocCount = 0;
+    Hull.Faces = (HMM_HullFace*) malloc(
+        (size_t) Hull.FaceCap * sizeof(HMM_HullFace));
+    Hull.Conflicts = (int*) malloc((size_t) Hull.FaceCap * sizeof(int));
+    Hull.Coplanar = (int*) malloc((size_t) Hull.FaceCap * sizeof(int));
+    ActiveList = (int*) malloc((size_t) Hull.FaceCap * sizeof(int));
+    NewFaces = (int*) malloc((size_t) Hull.FaceCap * sizeof(int));
+    Queue = (int*) malloc((size_t) Hull.FaceCap * sizeof(int));
+    Visited = (unsigned char*) malloc((size_t) Hull.FaceCap);
+    VisibleFaces = (int*) malloc((size_t) Hull.FaceCap * sizeof(int));
+    HorizonFace = (int*) malloc((size_t) Hull.FaceCap * sizeof(int));
+    HorizonSlot = (int*) malloc((size_t) Hull.FaceCap * sizeof(int));
+    HorizonU = (int*) malloc((size_t) Hull.FaceCap * sizeof(int));
+    HorizonV = (int*) malloc((size_t) Hull.FaceCap * sizeof(int));
+    EdgeLo = (int*) malloc((size_t) Hull.FaceCap * 3 * sizeof(int));
+    EdgeHi = (int*) malloc((size_t) Hull.FaceCap * 3 * sizeof(int));
+    EdgeFace = (int*) malloc((size_t) Hull.FaceCap * 3 * sizeof(int));
+    EdgeSlot = (int*) malloc((size_t) Hull.FaceCap * 3 * sizeof(int));
+    EdgeUsed = 0;
+    if (Hull.PointNext == 0 || Hull.PointOwner == 0 || Hull.Faces == 0
+        || Hull.Conflicts == 0 || Hull.Coplanar == 0 || ActiveList == 0
+        || NewFaces == 0 || Queue == 0 || Visited == 0 || VisibleFaces == 0
+        || HorizonFace == 0 || HorizonSlot == 0
+        || HorizonU == 0 || HorizonV == 0 || EdgeLo == 0 || EdgeHi == 0
+        || EdgeFace == 0 || EdgeSlot == 0)
+    {
+        FailStatus = HMM_HULL_OUT_OF_MEMORY;
+        goto QuickHullCleanup;
+    }
+
+    for (I = 0; I < UniqueCount; I++)
+    {
+        Hull.PointNext[I] = -1;
+        Hull.PointOwner[I] = -1;
+    }
+    for (I = 0; I < Hull.FaceCap; I++)
+    {
+        Hull.Conflicts[I] = -1;
+        Hull.Coplanar[I] = -1;
+    }
+
+    /*
+      Step 1: extreme points along the six axis directions. The widest pair
+      gives the longest edge; the farthest point from it gives a triangle;
+      the farthest point from its plane completes the initial tetrahedron.
+    */
+    {
+        float AxisBest[6];
+        for (I = 0; I < 6; I++)
+        {
+            Extremes[I] = 0;
+            AxisBest[I] = 0.0f;
+        }
+        for (I = 0; I < UniqueCount; I++)
+        {
+            float Vals[6];
+            Vals[0] = Hull.Points[I].X;
+            Vals[1] = -Hull.Points[I].X;
+            Vals[2] = Hull.Points[I].Y;
+            Vals[3] = -Hull.Points[I].Y;
+            Vals[4] = Hull.Points[I].Z;
+            Vals[5] = -Hull.Points[I].Z;
+            for (K = 0; K < 6; K++)
+            {
+                if (I == 0 || Vals[K] > AxisBest[K])
+                {
+                    AxisBest[K] = Vals[K];
+                    Extremes[K] = I;
+                }
+            }
+        }
+    }
+
+    TetraFound = 0;
+    {
+        int PairI = 0, PairJ = 1;
+        float BestSep = -1.0f;
+        int A, B, C, D;
+
+        for (I = 0; I < 6 && !TetraFound; I++)
+        {
+            for (J = I + 1; J < 6; J++)
+            {
+                float Sep = HMM_LenSqrV3(HMM_SubV3(Hull.Points[Extremes[I]],
+                                                    Hull.Points[Extremes[J]]));
+                if (Sep > BestSep)
+                {
+                    BestSep = Sep;
+                    PairI = Extremes[I];
+                    PairJ = Extremes[J];
+                }
+            }
+        }
+        A = PairI;
+        B = PairJ;
+
+        /* Farthest point from line AB. */
+        C = -1;
+        {
+            HMM_Vec3 AB = HMM_SubV3(Hull.Points[B], Hull.Points[A]);
+            float BestArea = -1.0f;
+            for (I = 0; I < UniqueCount; I++)
+            {
+                HMM_Vec3 AP = HMM_SubV3(Hull.Points[I], Hull.Points[A]);
+                HMM_Vec3 Cross = HMM_Cross(AB, AP);
+                float Area = HMM_LenSqrV3(Cross);
+                if (Area > BestArea)
+                {
+                    BestArea = Area;
+                    C = I;
+                }
+            }
+        }
+        if (C == -1 || BestSep <= Hull.Epsilon * Hull.Epsilon)
+        {
+            FailStatus = HMM_HULL_ALL_COPLANAR;
+            goto QuickHullCleanup;
+        }
+
+        /* Farthest point from plane ABC. */
+        D = -1;
+        {
+            HMM_Vec3 N = HMM_Cross(
+                HMM_SubV3(Hull.Points[B], Hull.Points[A]),
+                HMM_SubV3(Hull.Points[C], Hull.Points[A]));
+            float NLen = HMM_LenV3(N);
+            float BestDist = -1.0f;
+            if (NLen > 0.0f)
+            {
+                for (I = 0; I < UniqueCount; I++)
+                {
+                    float Dist = HMM_DotV3(
+                        HMM_SubV3(Hull.Points[I], Hull.Points[A]), N) / NLen;
+                    if (Dist < 0.0f)
+                    {
+                        Dist = -Dist;
+                    }
+                    if (Dist > BestDist)
+                    {
+                        BestDist = Dist;
+                        D = I;
+                    }
+                }
+            }
+            if (D == -1 || BestDist <= Hull.Epsilon)
+            {
+                FailStatus = HMM_HULL_ALL_COPLANAR;
+                goto QuickHullCleanup;
+            }
+        }
+
+        Tetra[0] = A;
+        Tetra[1] = B;
+        Tetra[2] = C;
+        Tetra[3] = D;
+        TetraFound = 1;
+    }
+
+    if (!TetraFound)
+    {
+        FailStatus = HMM_HULL_ALL_COPLANAR;
+        goto QuickHullCleanup;
+    }
+
+    /*
+      Build the four tetrahedron faces. A provisional winding is assigned,
+      then each face is flipped until its opposite vertex is on the interior
+      side (a negative signed distance), which makes every normal outward.
+    */
+    {
+        int Orders[4][3] = {
+            { 1, 2, 3 }, /* opposite 0 */
+            { 0, 3, 2 }, /* opposite 1 */
+            { 0, 1, 3 }, /* opposite 2 */
+            { 0, 2, 1 }  /* opposite 3 */
+        };
+        for (I = 0; I < 4; I++)
+        {
+            int F = HMM__HullAllocFace(&Hull);
+            if (F == -1)
+            {
+                FailStatus = HMM_HULL_OUT_OF_MEMORY;
+                goto QuickHullCleanup;
+            }
+            InitialFaces[I] = F;
+            Hull.Faces[F].Vertices[0] = Tetra[Orders[I][0]];
+            Hull.Faces[F].Vertices[1] = Tetra[Orders[I][1]];
+            Hull.Faces[F].Vertices[2] = Tetra[Orders[I][2]];
+
+            if (HMM__HullFaceDistance(&Hull, F, &Hull.Points[Tetra[I]]) > 0.0f)
+            {
+                int Tmp = Hull.Faces[F].Vertices[1];
+                Hull.Faces[F].Vertices[1] = Hull.Faces[F].Vertices[2];
+                Hull.Faces[F].Vertices[2] = Tmp;
+            }
+        }
+        for (I = 0; I < 4; I++)
+        {
+            for (J = I + 1; J < 4; J++)
+            {
+                HMM__HullConnect(&Hull, InitialFaces[I], InitialFaces[J]);
+            }
+        }
+    }
+
+    /* Step 2: initial assignment of all points to tetrahedron faces. */
+    for (I = 0; I < UniqueCount; I++)
+    {
+        HMM__HullAssignPoint(&Hull, I, InitialFaces, 4, Hull.Epsilon);
+    }
+
+    /* Snapshot of active face slots for later reassignment scans. */
+    ActiveCount = 0;
+    {
+        int F = Hull.ActiveHead;
+        if (F != -1)
+        {
+            do
+            {
+                ActiveList[ActiveCount++] = F;
+                F = Hull.Faces[F].Next;
+            } while (F != Hull.ActiveHead);
+        }
+    }
+
+    /* Step 3: expand over visible faces. */
+    for (;;)
+    {
+        int PickFace = -1;
+        int PickPoint = -1;
+        float PickDist = Hull.Epsilon;
+        int HorizonCount = 0;
+        int VisibleCount = 0;
+        int F;
+
+        /* Pick a face with a conflict; take its farthest conflict point. */
+        F = Hull.ActiveHead;
+        if (F != -1)
+        {
+            do
+            {
+                int P = Hull.Conflicts[F];
+                while (P != -1)
+                {
+                    float D = HMM__HullFaceDistance(&Hull, F,
+                                                    &Hull.Points[P]);
+                    if (D > PickDist)
+                    {
+                        PickDist = D;
+                        PickFace = F;
+                        PickPoint = P;
+                    }
+                    P = Hull.PointNext[P];
+                }
+                F = Hull.Faces[F].Next;
+            } while (F != Hull.ActiveHead);
+        }
+
+        if (PickFace == -1)
+        {
+            break;
+        }
+
+        /*
+          BFS over faces visible from PickPoint. Each reached face is in one
+          of three states: 0 = unknown, 1 = visible (point beyond epsilon),
+          2 = non-visible. Only visible faces are expanded. The horizon is
+          every edge from a visible face to a non-visible one; collecting it
+          in a separate pass finds each boundary exactly once regardless of
+          traversal order.
+        */
+        memset(Visited, 0, (size_t) Hull.FaceCap);
+        QueueHead = 0;
+        QueueTail = 0;
+        Queue[QueueTail++] = PickFace;
+        Visited[PickFace] = 1;
+
+        while (QueueHead < QueueTail)
+        {
+            int Cur = Queue[QueueHead++];
+            HMM_HullFace* CF = &Hull.Faces[Cur];
+            VisibleFaces[VisibleCount++] = Cur;
+
+            for (I = 0; I < 3; I++)
+            {
+                int N = CF->Neighbors[I];
+                if (N == -1 || Visited[N] != 0)
+                {
+                    continue;
+                }
+                if (HMM__HullFaceDistance(&Hull, N,
+                                          &Hull.Points[PickPoint])
+                    > Hull.Epsilon)
+                {
+                    Visited[N] = 1;
+                    Queue[QueueTail++] = N;
+                }
+                else
+                {
+                    Visited[N] = 2;
+                }
+            }
+        }
+
+        /* Collect each visible/non-visible boundary edge exactly once. */
+        for (I = 0; I < VisibleCount; I++)
+        {
+            int Cur = VisibleFaces[I];
+            HMM_HullFace* CF = &Hull.Faces[Cur];
+            int S;
+            for (S = 0; S < 3; S++)
+            {
+                int N = CF->Neighbors[S];
+                if (N != -1 && Visited[N] == 2)
+                {
+                    HorizonFace[HorizonCount] = Cur;
+                    HorizonSlot[HorizonCount] = S;
+                    HorizonU[HorizonCount] = CF->Vertices[S];
+                    HorizonV[HorizonCount] = CF->Vertices[(S + 1) % 3];
+                    HorizonCount++;
+                }
+            }
+        }
+
+        /* The picked face must have at least one horizon boundary. */
+        if (HorizonCount == 0)
+        {
+            /*
+              Numerical edge case: drop the stale conflict and try again
+              rather than removing the whole hull.
+            */
+            {
+                int* Head = &Hull.Conflicts[PickFace];
+                int P = *Head;
+                while (P != -1 && P != PickPoint)
+                {
+                    Head = &Hull.PointNext[P];
+                    P = *Head;
+                }
+                if (P != -1)
+                {
+                    *Head = Hull.PointNext[P];
+                    Hull.PointNext[P] = -1;
+                    Hull.PointOwner[P] = -1;
+                }
+            }
+            continue;
+        }
+
+        /* Release point lists of visible faces back to the unassigned pool. */
+        for (I = 0; I < VisibleCount; I++)
+        {
+            int VF = VisibleFaces[I];
+            int P = Hull.Conflicts[VF];
+            while (P != -1)
+            {
+                int NextP = Hull.PointNext[P];
+                Hull.PointNext[P] = -1;
+                Hull.PointOwner[P] = -1;
+                P = NextP;
+            }
+            Hull.Conflicts[VF] = -1;
+
+            P = Hull.Coplanar[VF];
+            while (P != -1)
+            {
+                int NextP = Hull.PointNext[P];
+                Hull.PointNext[P] = -1;
+                Hull.PointOwner[P] = -1;
+                P = NextP;
+            }
+            Hull.Coplanar[VF] = -1;
+        }
+
+        /*
+          Cap the horizon with one new face per horizon edge. An undirected
+          edge map (keyed by the unordered vertex pair) records every
+          directed half-edge of the new faces, so each pair is wired to its
+          exact counterpart instead of guessing from shared vertices.
+        */
+        NewCount = 0;
+        for (I = 0; I < HorizonCount; I++)
+        {
+            int NF = HMM__HullAllocFace(&Hull);
+            if (NF == -1)
+            {
+                FailStatus = HMM_HULL_OUT_OF_MEMORY;
+                goto QuickHullCleanup;
+            }
+            /*
+              Horizon edge runs U->V on the visible face, whose outward
+              normal points away from the visible point. The cap face uses
+              the same U->V order with PickPoint last, which makes its normal
+              point toward PickPoint (outward on the new hull).
+            */
+            Hull.Faces[NF].Vertices[0] = HorizonU[I];
+            Hull.Faces[NF].Vertices[1] = HorizonV[I];
+            Hull.Faces[NF].Vertices[2] = PickPoint;
+            Hull.Faces[NF].Neighbors[0] = -1;
+            Hull.Faces[NF].Neighbors[1] = -1;
+            Hull.Faces[NF].Neighbors[2] = -1;
+            NewFaces[NewCount++] = NF;
+        }
+
+        /* Build the half-edge map for the new faces. */
+        EdgeUsed = 0;
+        for (I = 0; I < NewCount; I++)
+        {
+            int NF = NewFaces[I];
+            int S;
+            for (S = 0; S < 3; S++)
+            {
+                int U = Hull.Faces[NF].Vertices[S];
+                int V = Hull.Faces[NF].Vertices[(S + 1) % 3];
+                int Lo = U < V ? U : V;
+                int Hi = U < V ? V : U;
+                int E;
+                int Found = 0;
+                for (E = 0; E < EdgeUsed; E++)
+                {
+                    if (EdgeLo[E] == Lo && EdgeHi[E] == Hi)
+                    {
+                        /* Second directed half-edge: join the two faces. */
+                        Hull.Faces[NF].Neighbors[S] = EdgeFace[E];
+                        Hull.Faces[EdgeFace[E]].Neighbors[EdgeSlot[E]] = NF;
+                        Found = 1;
+                        break;
+                    }
+                }
+                if (!Found)
+                {
+                    EdgeLo[EdgeUsed] = Lo;
+                    EdgeHi[EdgeUsed] = Hi;
+                    EdgeFace[EdgeUsed] = NF;
+                    EdgeSlot[EdgeUsed] = S;
+                    EdgeUsed++;
+                }
+            }
+        }
+
+        /*
+          Reconnect each new face across its horizon edge to the surviving
+          non-visible face. The horizon edge is local slot 0 of the new face.
+        */
+        for (I = 0; I < HorizonCount; I++)
+        {
+            int NF = NewFaces[I];
+            int OldNeighbor =
+                Hull.Faces[HorizonFace[I]].Neighbors[HorizonSlot[I]];
+            if (OldNeighbor != -1)
+            {
+                int Slot = HMM__HullFindEdge(&Hull, OldNeighbor,
+                                             HorizonU[I], HorizonV[I]);
+                if (Slot != -1)
+                {
+                    Hull.Faces[OldNeighbor].Neighbors[Slot] = NF;
+                    Hull.Faces[NF].Neighbors[0] = OldNeighbor;
+                }
+            }
+        }
+
+        /* Delete the visible faces (after all horizon references are taken). */
+        for (I = 0; I < VisibleCount; I++)
+        {
+            int VF = VisibleFaces[I];
+            HMM_HullFace* VFace = &Hull.Faces[VF];
+            int Prev;
+            int Next;
+
+            /* Unlink from the active cycle directly. */
+            Prev = -1;
+            {
+                int Cur = Hull.ActiveHead;
+                do
+                {
+                    if (Hull.Faces[Cur].Next == VF)
+                    {
+                        Prev = Cur;
+                        break;
+                    }
+                    Cur = Hull.Faces[Cur].Next;
+                } while (Cur != Hull.ActiveHead);
+            }
+            Next = VFace->Next;
+            if (Prev != -1)
+            {
+                Hull.Faces[Prev].Next = Next;
+            }
+            if (Hull.ActiveHead == VF)
+            {
+                Hull.ActiveHead = (Next == VF) ? -1 : Next;
+            }
+
+            VFace->Next = Hull.FreeHead;
+            Hull.FreeHead = VF;
+            Hull.FaceCount--;
+        }
+
+        /*
+          Reassign every unassigned point. First against the new faces; any
+          point still unclaimed is tested against the whole active hull so a
+          missed conflict cannot survive.
+        */
+        for (I = 0; I < UniqueCount; I++)
+        {
+            if (Hull.PointOwner[I] == -1)
+            {
+                HMM__HullAssignPoint(&Hull, I, NewFaces, NewCount,
+                                     Hull.Epsilon);
+            }
+        }
+
+        ActiveCount = 0;
+        F = Hull.ActiveHead;
+        if (F != -1)
+        {
+            do
+            {
+                ActiveList[ActiveCount++] = F;
+                F = Hull.Faces[F].Next;
+            } while (F != Hull.ActiveHead);
+        }
+        for (I = 0; I < UniqueCount; I++)
+        {
+            if (Hull.PointOwner[I] == -1)
+            {
+                HMM__HullAssignPoint(&Hull, I, ActiveList, ActiveCount,
+                                     Hull.Epsilon);
+            }
+        }
+    }
+
+    /*
+      Step 4: compact the face array to the active faces so FaceCount and the
+      public indices are contiguous. Coplanar lists are preserved; points the
+      caller does not want are dropped here. Fresh arrays are allocated so the
+      active-face traversal is never disturbed by in-place overwrites.
+    */
+    {
+        int Write = 0;
+        int I2;
+        int F;
+        int* Remap;
+        HMM_HullFace* CompactFaces;
+        int* CompactConflicts;
+        int* CompactCoplanar;
+        int Cap;
+
+        Remap = (int*) malloc((size_t) Hull.FaceCap * sizeof(int));
+        if (Remap == 0)
+        {
+            FailStatus = HMM_HULL_OUT_OF_MEMORY;
+            goto QuickHullCleanup;
+        }
+
+        F = Hull.ActiveHead;
+        if (F != -1)
+        {
+            do
+            {
+                Remap[F] = Write;
+                Write++;
+                F = Hull.Faces[F].Next;
+            } while (F != Hull.ActiveHead);
+        }
+
+        Cap = Write > 0 ? Write : 1;
+        CompactFaces = (HMM_HullFace*) malloc(
+            (size_t) Cap * sizeof(HMM_HullFace));
+        CompactConflicts = (int*) malloc((size_t) Cap * sizeof(int));
+        CompactCoplanar = (int*) malloc((size_t) Cap * sizeof(int));
+        if (CompactFaces == 0 || CompactConflicts == 0
+            || CompactCoplanar == 0)
+        {
+            free(CompactFaces);
+            free(CompactConflicts);
+            free(CompactCoplanar);
+            free(Remap);
+            FailStatus = HMM_HULL_OUT_OF_MEMORY;
+            goto QuickHullCleanup;
+        }
+
+        for (I2 = 0; I2 < Cap; I2++)
+        {
+            CompactConflicts[I2] = -1;
+            CompactCoplanar[I2] = -1;
+        }
+
+        F = Hull.ActiveHead;
+        if (F != -1)
+        {
+            do
+            {
+                int NewIndex = Remap[F];
+                CompactFaces[NewIndex] = Hull.Faces[F];
+                CompactConflicts[NewIndex] = Hull.Conflicts[F];
+                CompactCoplanar[NewIndex] = Hull.Coplanar[F];
+                F = Hull.Faces[F].Next;
+            } while (F != Hull.ActiveHead);
+        }
+
+        free(Hull.Faces);
+        free(Hull.Conflicts);
+        free(Hull.Coplanar);
+        Hull.Faces = CompactFaces;
+        Hull.Conflicts = CompactConflicts;
+        Hull.Coplanar = CompactCoplanar;
+        Hull.FaceCount = Write;
+        Hull.FaceCap = Cap;
+        Hull.ActiveHead = -1;
+        Hull.FreeHead = -1;
+
+        /*
+          Rewrite neighbor indices to the compacted numbering, and record
+          which points are hull vertices so they can be excluded from the
+          per-face coplanar lists (a vertex is incident to several faces but
+          is not a "point lying on a face" in the coplanar sense).
+        */
+        {
+            unsigned char* IsVertex = (unsigned char*) calloc(
+                (size_t) (Hull.PointCount > 0 ? Hull.PointCount : 1),
+                sizeof(unsigned char));
+            if (IsVertex == 0)
+            {
+                free(Remap);
+                FailStatus = HMM_HULL_OUT_OF_MEMORY;
+                goto QuickHullCleanup;
+            }
+
+            for (I2 = 0; I2 < Write; I2++)
+            {
+                int K2;
+                for (K2 = 0; K2 < 3; K2++)
+                {
+                    int N = Hull.Faces[I2].Neighbors[K2];
+                    Hull.Faces[I2].Neighbors[K2] =
+                        (N == -1) ? -1 : Remap[N];
+                    IsVertex[Hull.Faces[I2].Vertices[K2]] = 1;
+                }
+            }
+
+            for (I2 = 0; I2 < Write; I2++)
+            {
+                int* Head = &Hull.Coplanar[I2];
+                int P = *Head;
+                while (P != -1)
+                {
+                    int NextP = Hull.PointNext[P];
+                    if (!Hull.KeepCoplanarPoints || IsVertex[P])
+                    {
+                        /* Drop this entry from the face's list. */
+                        *Head = NextP;
+                        Hull.PointNext[P] = -1;
+                        Hull.PointOwner[P] = -1;
+                    }
+                    else
+                    {
+                        Head = &Hull.PointNext[P];
+                    }
+                    P = NextP;
+                }
+            }
+
+            free(IsVertex);
+        }
+
+        free(Remap);
+    }
+
+QuickHullCleanup:
+    /* Scratch buffers are used on both the success and failure paths and are
+       never part of the returned hull, so always release them here. */
+    free(ActiveList);
+    free(NewFaces);
+    free(Queue);
+    free(Visited);
+    free(VisibleFaces);
+    free(HorizonFace);
+    free(HorizonSlot);
+    free(HorizonU);
+    free(HorizonV);
+    free(EdgeLo);
+    free(EdgeHi);
+    free(EdgeFace);
+    free(EdgeSlot);
+
+    if (FailStatus != HMM_HULL_OK)
+    {
+        HMM_FreeHull(&Hull);
+        return HMM__HullFail(FailStatus);
+    }
+
+    return Hull;
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+# pragma GCC diagnostic pop
+#endif
+
 
 #ifdef __cplusplus
 }
