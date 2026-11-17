@@ -3933,6 +3933,439 @@ void __hmm_invalid_generic(void);
 
 #endif
 
+/*
+ * =============================================================================
+ * Polygon clipping (Sutherland-Hodgman)
+ * =============================================================================
+ *
+ * Batch clipping of a subject polygon against any number of clipping
+ * regions using the Sutherland-Hodgman algorithm. Each region is a convex
+ * polygon whose edges define the interior half-planes; this is the standard
+ * Sutherland-Hodgman requirement, and either winding order is accepted.
+ * The subject polygon may be concave. Regions are applied in order, so their
+ * output can be chained (the result of one region feeds the next), which
+ * supports maps where a character crosses several areas.
+ *
+ * Degenerate inputs are handled explicitly:
+ *   - repeated vertices are removed before clipping,
+ *   - self-intersecting polygons are accepted but flagged: Sutherland-Hodgman
+ *     treats every edge independently, so a self-intersecting subject yields
+ *     a geometrically meaningless (though well-defined) result,
+ *   - an output that collapses to fewer than 3 non-repeating vertices is
+ *     flagged as degenerate.
+ *
+ * All functions use caller-provided storage; nothing in this section allocates
+ * memory.
+ */
+
+/* Bits reported in HMM_ClipResult.Flags. */
+#define HMM_CLIP_DEGENERATE       (1 << 0) /* Output has < 3 unique vertices. */
+#define HMM_CLIP_INPUT_REPEATED   (1 << 1) /* Repeated input points were dropped. */
+#define HMM_CLIP_INPUT_SELF_INTER (1 << 2) /* Input polygon self-intersects. */
+#define HMM_CLIP_EMPTY            (1 << 3) /* Polygon lies fully outside. */
+#define HMM_CLIP_DROPPED_EDGES    (1 << 4) /* Zero-length output edges removed. */
+
+/* A polygon in winding order (either winding is accepted). */
+typedef struct HMM_Polygon
+{
+    HMM_Vec2 *Points;
+    int Count;
+} HMM_Polygon;
+
+typedef struct HMM_ClipResult
+{
+    /* Vertices of the clipped polygon, written into caller-provided storage. */
+    HMM_Vec2 *Points;
+    int Count;
+    /* Combination of the HMM_CLIP_* flag bits above. */
+    int Flags;
+} HMM_ClipResult;
+
+/* Internal: squared distance, kept local so the section has no extra deps. */
+static inline float HMM__ClipDistSqr(HMM_Vec2 A, HMM_Vec2 B)
+{
+    float DX = B.X - A.X;
+    float DY = B.Y - A.Y;
+    return DX * DX + DY * DY;
+}
+
+/* Internal: strict, scale-free self-intersection test over every edge pair.
+ * Edges that share an endpoint are not considered intersecting, which keeps
+ * ordinary polygons from being flagged. Runs in O(n^2) on the cleaned input;
+ * callers here pass small polygons. */
+static inline int HMM__ClipSegmentsIntersect(HMM_Vec2 P1, HMM_Vec2 P2,
+                                             HMM_Vec2 Q1, HMM_Vec2 Q2)
+{
+    float D1X = P2.X - P1.X;
+    float D1Y = P2.Y - P1.Y;
+    float D2X = Q2.X - Q1.X;
+    float D2Y = Q2.Y - Q1.Y;
+    float Denom = D1X * D2Y - D1Y * D2X;
+
+    if (Denom == 0.0f)
+    {
+        return 0; /* Parallel (including collinear): no proper crossing. */
+    }
+
+    float SX = Q1.X - P1.X;
+    float SY = Q1.Y - P1.Y;
+    float T = (SX * D2Y - SY * D2X) / Denom;
+    float U = (SX * D1Y - SY * D1X) / Denom;
+
+    /* Strict inequalities: touching at a vertex is a shared endpoint case,
+     * not a self-intersection. */
+    return T > 0.0f && T < 1.0f && U > 0.0f && U < 1.0f;
+}
+
+static inline int HMM__ClipIsSelfIntersecting(const HMM_Vec2 *Points, int Count)
+{
+    int I, J;
+
+    if (Count < 4)
+    {
+        return 0;
+    }
+
+    for (I = 0; I < Count; I++)
+    {
+        HMM_Vec2 P1 = Points[I];
+        HMM_Vec2 P2 = Points[(I + 1) % Count];
+
+        for (J = I + 1; J < Count; J++)
+        {
+            /* Adjacent edges share a vertex and never count as crossing. */
+            if (J == I + 1 || (I == 0 && J == Count - 1))
+            {
+                continue;
+            }
+            if (HMM__ClipSegmentsIntersect(P1, P2, Points[J],
+                                           Points[(J + 1) % Count]))
+            {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* Internal: copy Points into Out with consecutive duplicates (including the
+ * wrap-around edge) removed. Returns the cleaned count and sets *Repeated. */
+static inline int HMM__ClipRemoveRepeated(const HMM_Vec2 *Points, int Count,
+                                          HMM_Vec2 *Out, int *Repeated)
+{
+    int I, OutCount = 0;
+
+    *Repeated = 0;
+    for (I = 0; I < Count; I++)
+    {
+        if (OutCount > 0 &&
+            HMM__ClipDistSqr(Out[OutCount - 1], Points[I]) == 0.0f)
+        {
+            *Repeated = 1;
+            continue;
+        }
+        Out[OutCount++] = Points[I];
+    }
+
+    if (OutCount > 1 &&
+        HMM__ClipDistSqr(Out[OutCount - 1], Out[0]) == 0.0f)
+    {
+        *Repeated = 1;
+        OutCount--;
+    }
+    return OutCount;
+}
+
+/* Internal: which side of directed edge A->B point P lies on. Positive is the
+ * interior (left) side, zero is on the edge. */
+static inline float HMM__ClipSide(HMM_Vec2 A, HMM_Vec2 B, HMM_Vec2 P)
+{
+    return (B.X - A.X) * (P.Y - A.Y) - (B.Y - A.Y) * (P.X - A.X);
+}
+
+/* Internal: intersection of segment S->E with the line through A->B. */
+static inline HMM_Vec2 HMM__ClipIntersect(HMM_Vec2 A, HMM_Vec2 B,
+                                          HMM_Vec2 S, HMM_Vec2 E)
+{
+    float Dx = B.X - A.X;
+    float Dy = B.Y - A.Y;
+    float Denom = Dx * (S.Y - E.Y) - Dy * (S.X - E.X);
+    float T = (Dx * (S.Y - A.Y) - Dy * (S.X - A.X)) / Denom;
+
+    HMM_Vec2 Result;
+    Result.X = S.X + T * (E.X - S.X);
+    Result.Y = S.Y + T * (E.Y - S.Y);
+    return Result;
+}
+
+/* Internal: twice the signed area of a polygon. Positive means
+ * counter-clockwise winding. */
+static inline float HMM__ClipSignedArea2(const HMM_Vec2 *Points, int Count)
+{
+    float TwiceArea = 0.0f;
+    int I;
+
+    for (I = 0; I < Count; I++)
+    {
+        HMM_Vec2 A = Points[I];
+        HMM_Vec2 B = Points[(I + 1) % Count];
+        TwiceArea += A.X * B.Y - A.Y * B.X;
+    }
+    return TwiceArea;
+}
+
+/* Internal: clip polygon Cur (CurCount vertices) against one region. BufA and
+ * BufB are two equally-sized scratch buffers, each holding at least CurCount +
+ * Clip.Count vertices; the result is written back into the OutBuf and
+ * OutCount out-parameters, using whichever buffer it ends in. ReverseRegion
+ * Returns 0 when the polygon has been clipped away entirely. */
+static inline int HMM__ClipAgainstRegion(const HMM_Polygon Clip,
+                                         int ReverseRegion, int PreserveEdges,
+                                         HMM_Vec2 *BufA, HMM_Vec2 *BufB,
+                                         HMM_Vec2 **OutBuf, int *OutCount,
+                                         int *Flags)
+{
+    HMM_Vec2 *Cur = *OutBuf;
+    int CurCount = *OutCount;
+    int Active = 0, Edge, I;
+
+    for (Edge = 0; Edge < Clip.Count && CurCount > 0; Edge++)
+    {
+        int Idx = ReverseRegion ? (Clip.Count - 1 - Edge) : Edge;
+        HMM_Vec2 A = Clip.Points[Idx];
+        int NextIdx = (Idx + (ReverseRegion ? -1 : 1) + Clip.Count) %
+                      Clip.Count;
+        HMM_Vec2 B = Clip.Points[NextIdx];
+        HMM_Vec2 *Next = Active ? BufA : BufB;
+        int NextCount = 0;
+
+        for (I = 0; I < CurCount; I++)
+        {
+            HMM_Vec2 S = Cur[I];
+            HMM_Vec2 E = Cur[(I + 1) % CurCount];
+            int SIn = HMM__ClipSide(A, B, S) >= 0.0f;
+            int EIn = HMM__ClipSide(A, B, E) >= 0.0f;
+
+            if (SIn && EIn)
+            {
+                Next[NextCount++] = E;
+            }
+            else if (SIn && !EIn)
+            {
+                Next[NextCount++] = HMM__ClipIntersect(A, B, S, E);
+            }
+            else if (!SIn && EIn)
+            {
+                Next[NextCount++] = HMM__ClipIntersect(A, B, S, E);
+                Next[NextCount++] = E;
+            }
+        }
+
+        Cur = Next;
+        CurCount = NextCount;
+        Active ^= 1;
+    }
+
+    if (!PreserveEdges && CurCount > 0)
+    {
+        HMM_Vec2 *Cleaned = Active ? BufB : BufA;
+        int CleanCount = 0;
+        for (I = 0; I < CurCount; I++)
+        {
+            if (CleanCount > 0 &&
+                HMM__ClipDistSqr(Cleaned[CleanCount - 1], Cur[I]) == 0.0f)
+            {
+                *Flags |= HMM_CLIP_DROPPED_EDGES;
+                continue;
+            }
+            Cleaned[CleanCount++] = Cur[I];
+        }
+        if (CleanCount > 1 &&
+            HMM__ClipDistSqr(Cleaned[CleanCount - 1], Cleaned[0]) == 0.0f)
+        {
+            *Flags |= HMM_CLIP_DROPPED_EDGES;
+            CleanCount--;
+        }
+        Cur = Cleaned;
+        CurCount = CleanCount;
+    }
+
+    *OutBuf = Cur;
+    *OutCount = CurCount;
+    return CurCount > 0;
+}
+
+/*
+ * Clips polygon In against one convex clipping region Clip (in either winding
+ * order; the subject polygon In may be concave), writing the result into
+ * Storage and returning it. Storage must hold at least
+ * 2 * (In.Count + Clip.Count) vertices: clipping adds at most one vertex per
+ * region edge, and two equally-sized ping-pong buffers are used internally.
+ *
+ * PreserveEdges keeps consecutive coincident vertices and zero-length edges
+ * that clipping can produce on boundary cases; otherwise they are removed and
+ * HMM_CLIP_DROPPED_EDGES is reported.
+ *
+ * InputFlags are OR-ed into the result so flags survive region chaining.
+ */
+static inline HMM_ClipResult HMM_ClipPolygonOne(const HMM_Polygon In,
+                                                const HMM_Polygon Clip,
+                                                HMM_Vec2 *Storage,
+                                                int PreserveEdges,
+                                                int InputFlags)
+{
+    int Capacity = In.Count + Clip.Count;
+    int ReverseRegion = HMM__ClipSignedArea2(Clip.Points, Clip.Count) < 0.0f;
+    HMM_Vec2 *Cur = Storage;
+    int CurCount, I;
+    HMM_ClipResult Result;
+
+    /* Private copy so caller data is never modified. */
+    for (I = 0; I < In.Count; I++)
+    {
+        Cur[I] = In.Points[I];
+    }
+    CurCount = In.Count;
+
+    HMM__ClipAgainstRegion(Clip, ReverseRegion, PreserveEdges, Storage,
+                           Storage + Capacity, &Cur, &CurCount, &InputFlags);
+
+    Result.Points = Cur;
+    Result.Count = CurCount;
+    Result.Flags = InputFlags;
+    if (CurCount == 0)
+    {
+        Result.Flags |= HMM_CLIP_EMPTY | HMM_CLIP_DEGENERATE;
+    }
+    else if (CurCount < 3)
+    {
+        Result.Flags |= HMM_CLIP_DEGENERATE;
+    }
+    return Result;
+}
+
+/*
+ * Batch-clips polygon In against RegionCount convex clipping regions, applied
+ * in order (each region clips the output of the previous one, so multi-region
+ * chains are supported). The subject polygon may be concave. Set RegionCount
+ * to any non-negative value; zero regions returns a cleaned copy of the input.
+ *
+ * Storage must hold at least 3 * Capacity vertices, where Capacity is
+ * In.Count plus the sum of the region vertex counts. Clipping against one
+ * region adds at most one vertex per region edge, so Capacity bounds the
+ * vertex count at every step of the chain. One slot holds the working polygon
+ * while the other two are per-region ping-pong scratch space.
+ *
+ * PreserveEdges configures zero-length edge handling as in
+ * HMM_ClipPolygonOne. The returned HMM_ClipResult describes the final polygon
+ * and carries every flag raised along the way, including flags about the
+ * original input.
+ */
+static inline HMM_ClipResult HMM_ClipPolygon(const HMM_Polygon In,
+                                             const HMM_Polygon *Regions,
+                                             int RegionCount,
+                                             HMM_Vec2 *Storage,
+                                             int PreserveEdges)
+{
+    int RegionPoints = 0, Capacity, I;
+    int Flags = 0, Repeated = 0, CleanCount;
+    HMM_Vec2 *Work, *BufA, *BufB, *Cur;
+    int CurCount;
+    HMM_ClipResult Result;
+
+    for (I = 0; I < RegionCount; I++)
+    {
+        RegionPoints += Regions[I].Count;
+    }
+    /* Upper bound on vertices at every step: the original vertices plus at
+     * most one new intersection per edge of every region in the chain. */
+    Capacity = In.Count + RegionPoints;
+
+    Work = Storage;
+    BufA = Storage + Capacity;
+    BufB = Storage + 2 * Capacity;
+
+    if (In.Count <= 0)
+    {
+        CleanCount = 0;
+    }
+    else
+    {
+        CleanCount = HMM__ClipRemoveRepeated(In.Points, In.Count, Work,
+                                             &Repeated);
+    }
+    if (Repeated)
+    {
+        Flags |= HMM_CLIP_INPUT_REPEATED;
+    }
+    if (CleanCount >= 4 && HMM__ClipIsSelfIntersecting(Work, CleanCount))
+    {
+        Flags |= HMM_CLIP_INPUT_SELF_INTER;
+    }
+
+    if (CleanCount < 3)
+    {
+        Flags |= HMM_CLIP_DEGENERATE;
+        if (CleanCount == 0)
+        {
+            Flags |= HMM_CLIP_EMPTY;
+        }
+        Result.Points = Work;
+        Result.Count = CleanCount;
+        Result.Flags = Flags;
+        return Result;
+    }
+
+    if (RegionCount == 0)
+    {
+        Result.Points = Work;
+        Result.Count = CleanCount;
+        Result.Flags = Flags;
+        return Result;
+    }
+
+    Cur = Work;
+    CurCount = CleanCount;
+    for (I = 0; I < RegionCount; I++)
+    {
+        int ReverseRegion, J;
+
+        /* The clip routine always starts writing into BufB, so move the
+         * current polygon back to Work first; otherwise a result that ended
+         * the previous region in BufB would be overwritten as it is read. */
+        if (Cur != Work)
+        {
+            for (J = 0; J < CurCount; J++)
+            {
+                Work[J] = Cur[J];
+            }
+            Cur = Work;
+        }
+
+        ReverseRegion =
+            HMM__ClipSignedArea2(Regions[I].Points, Regions[I].Count) < 0.0f;
+
+        if (!HMM__ClipAgainstRegion(Regions[I], ReverseRegion, PreserveEdges,
+                                    BufA, BufB, &Cur, &CurCount, &Flags))
+        {
+            break;
+        }
+    }
+
+    Result.Points = Cur;
+    Result.Count = CurCount;
+    Result.Flags = Flags;
+    if (CurCount == 0)
+    {
+        Result.Flags |= HMM_CLIP_EMPTY | HMM_CLIP_DEGENERATE;
+    }
+    else if (CurCount < 3)
+    {
+        Result.Flags |= HMM_CLIP_DEGENERATE;
+    }
+    return Result;
+}
+
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic pop
 #endif
