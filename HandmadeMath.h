@@ -2574,6 +2574,235 @@ static inline HMM_Quat HMM_M4ToQ_LH(HMM_Mat4 M)
     return Q;
 }
 
+/*
+ * Batch quaternion re-orthogonalization
+ *
+ * Repeated attitude integration (e.g. summing many small angular steps)
+ * leaves the rotation represented by a quaternion with a basis that is no
+ * longer orthonormal: the frame drifts away from SO(3). These functions
+ * repair a batch of drifted quaternions in three stages:
+ *
+ *   1. Gram-Schmidt orthogonalization of the three basis vectors of the
+ *      rotation matrix reconstructed from the quaternion.
+ *   2. Rebuilding the quaternion from the corrected basis (using the same
+ *      Mike Day conversion as HMM_M4ToQ_RH, specialized for 3x3 matrices).
+ *   3. A final normalization pass on the rebuilt quaternion.
+ *
+ * A singular input (an all-zero/NaN quaternion, or a basis whose first two
+ * independent directions collapse) cannot be orthogonalized. The single
+ * quaternion variant reports this by returning zero. The batch variant either
+ * aborts at the first singular entry (HMM_ORTHO_REPORT_AND_ABORT) or skips
+ * it and leaves the output compacted, returning a count smaller than the
+ * input count (HMM_ORTHO_SKIP_SINGULAR).
+ */
+
+#ifndef HMM_ORTHO_EPSILON
+#define HMM_ORTHO_EPSILON 1.0e-6f
+#endif
+
+#define HMM_ORTHO_PRESERVE_HANDEDNESS 1
+#define HMM_ORTHO_RELAX_HANDEDNESS    0
+
+#define HMM_ORTHO_REPORT_AND_ABORT 0
+#define HMM_ORTHO_SKIP_SINGULAR    1
+
+/*
+ * Stage 1: Gram-Schmidt correction of the three column basis vectors.
+ * Returns 0 when the basis is singular, 1 on success. The corrected frame is
+ * written to Out. When PreserveHandedness is nonzero, the third basis vector
+ * is rebuilt as the cross product of the first two so the original handedness
+ * is restored; otherwise it is merely projected orthogonal.
+ */
+static inline HMM_Bool HMM_OrthogonalizeM3(HMM_Mat3 Matrix, HMM_Bool PreserveHandedness, HMM_Mat3 *Out)
+{
+    HMM_Vec3 V0, V1, V2;
+    float InvLen, Projection;
+
+    V0 = Matrix.Columns[0];
+    if (!(HMM_LenSqrV3(V0) > HMM_ORTHO_EPSILON * HMM_ORTHO_EPSILON)) {
+        return 0;
+    }
+
+    InvLen = HMM_InvSqrtF(HMM_LenSqrV3(V0));
+    V0 = HMM_MulV3F(V0, InvLen);
+
+    Projection = HMM_DotV3(Matrix.Columns[1], V0);
+    V1 = HMM_SubV3(Matrix.Columns[1], HMM_MulV3F(V0, Projection));
+    if (!(HMM_LenSqrV3(V1) > HMM_ORTHO_EPSILON * HMM_ORTHO_EPSILON)) {
+        return 0;
+    }
+
+    InvLen = HMM_InvSqrtF(HMM_LenSqrV3(V1));
+    V1 = HMM_MulV3F(V1, InvLen);
+
+    if (PreserveHandedness) {
+        V2 = HMM_Cross(V0, V1);
+    } else {
+        Projection = HMM_DotV3(Matrix.Columns[2], V0);
+        V2 = HMM_SubV3(Matrix.Columns[2], HMM_MulV3F(V0, Projection));
+        Projection = HMM_DotV3(V2, V1);
+        V2 = HMM_SubV3(V2, HMM_MulV3F(V1, Projection));
+        if (!(HMM_LenSqrV3(V2) > HMM_ORTHO_EPSILON * HMM_ORTHO_EPSILON)) {
+            return 0;
+        }
+        V2 = HMM_NormV3(V2);
+    }
+
+    Out->Columns[0] = V0;
+    Out->Columns[1] = V1;
+    Out->Columns[2] = V2;
+
+    return 1;
+}
+
+/*
+ * Stage 2 helper: rebuild a quaternion from an orthonormal 3x3 basis. Uses
+ * the same branch structure as HMM_M4ToQ_RH; the 3x3 rotation part of a
+ * HMM_QToM4 result occupies Elements[c][r] with c the column and r the row.
+ */
+static inline HMM_Quat HMM_OrthoM3ToQ(HMM_Mat3 M)
+{
+    float T;
+    HMM_Quat Q;
+
+    if (M.Elements[2][2] < 0.0f) {
+        if (M.Elements[0][0] > M.Elements[1][1]) {
+            T = 1 + M.Elements[0][0] - M.Elements[1][1] - M.Elements[2][2];
+            Q = HMM_Q(
+                T,
+                M.Elements[0][1] + M.Elements[1][0],
+                M.Elements[2][0] + M.Elements[0][2],
+                M.Elements[1][2] - M.Elements[2][1]
+            );
+        } else {
+            T = 1 - M.Elements[0][0] + M.Elements[1][1] - M.Elements[2][2];
+            Q = HMM_Q(
+                M.Elements[0][1] + M.Elements[1][0],
+                T,
+                M.Elements[1][2] + M.Elements[2][1],
+                M.Elements[2][0] - M.Elements[0][2]
+            );
+        }
+    } else {
+        if (M.Elements[0][0] < -M.Elements[1][1]) {
+            T = 1 - M.Elements[0][0] - M.Elements[1][1] + M.Elements[2][2];
+            Q = HMM_Q(
+                M.Elements[2][0] + M.Elements[0][2],
+                M.Elements[1][2] + M.Elements[2][1],
+                T,
+                M.Elements[0][1] - M.Elements[1][0]
+            );
+        } else {
+            T = 1 + M.Elements[0][0] + M.Elements[1][1] + M.Elements[2][2];
+            Q = HMM_Q(
+                M.Elements[1][2] - M.Elements[2][1],
+                M.Elements[2][0] - M.Elements[0][2],
+                M.Elements[0][1] - M.Elements[1][0],
+                T
+            );
+        }
+    }
+
+    Q = HMM_MulQF(Q, 0.5f / HMM_SqrtF(T));
+
+    return Q;
+}
+
+/*
+ * All three stages for a single quaternion. Returns 0 (and leaves Out
+ * untouched) when the input is singular, 1 on success.
+ *
+ * The rotation matrix is built from the raw quaternion components rather than
+ * via HMM_QToM4, because HMM_QToM4 normalizes internally and would erase the
+ * accumulated drift before Gram-Schmidt gets a chance to correct it.
+ */
+static inline HMM_Bool HMM_OrthogonalizeQ(HMM_Quat Quat, HMM_Bool PreserveHandedness, HMM_Quat *Out)
+{
+    HMM_Mat3 Rotation, Corrected;
+    HMM_Quat Rebuilt;
+    float XX, YY, ZZ, XY, XZ, YZ, WX, WY, WZ;
+
+    if (!(HMM_LenSqrV3(Quat.XYZ) + Quat.W * Quat.W > HMM_ORTHO_EPSILON * HMM_ORTHO_EPSILON)) {
+        return 0;
+    }
+
+    XX = Quat.X * Quat.X;
+    YY = Quat.Y * Quat.Y;
+    ZZ = Quat.Z * Quat.Z;
+    XY = Quat.X * Quat.Y;
+    XZ = Quat.X * Quat.Z;
+    YZ = Quat.Y * Quat.Z;
+    WX = Quat.W * Quat.X;
+    WY = Quat.W * Quat.Y;
+    WZ = Quat.W * Quat.Z;
+
+    Rotation.Elements[0][0] = 1.0f - 2.0f * (YY + ZZ);
+    Rotation.Elements[0][1] = 2.0f * (XY + WZ);
+    Rotation.Elements[0][2] = 2.0f * (XZ - WY);
+
+    Rotation.Elements[1][0] = 2.0f * (XY - WZ);
+    Rotation.Elements[1][1] = 1.0f - 2.0f * (XX + ZZ);
+    Rotation.Elements[1][2] = 2.0f * (YZ + WX);
+
+    Rotation.Elements[2][0] = 2.0f * (XZ + WY);
+    Rotation.Elements[2][1] = 2.0f * (YZ - WX);
+    Rotation.Elements[2][2] = 1.0f - 2.0f * (XX + YY);
+
+    /* Stage 1: Gram-Schmidt correction of the three basis vectors. */
+    if (!HMM_OrthogonalizeM3(Rotation, PreserveHandedness, &Corrected)) {
+        return 0;
+    }
+
+    /* Stage 2: rebuild the quaternion from the corrected basis. */
+    Rebuilt = HMM_OrthoM3ToQ(Corrected);
+
+    /* Stage 3: one unified normalization of the rebuilt quaternion. */
+    *Out = HMM_NormQ(Rebuilt);
+
+    return 1;
+}
+
+/*
+ * Batch entry point. In points to Count drifted quaternions; the corrected
+ * quaternions are written to Out. BatchSize controls how many entries are
+ * processed per internal chunk (a BatchSize <= 0 means the whole batch in one
+ * chunk). PreserveHandedness selects the stage-1 policy, SingularPolicy the
+ * behavior on singular inputs. Returns the number of quaternions written:
+ * equal to Count on full success, smaller when singular entries were skipped,
+ * or the index of the first singular entry when aborting (the number written
+ * before it).
+ */
+static inline int HMM_OrthogonalizeBatchQ(const HMM_Quat *In, int Count, int BatchSize,
+    HMM_Bool PreserveHandedness, HMM_Bool SingularPolicy, HMM_Quat *Out)
+{
+    int BatchStart, BatchEnd, Index;
+    int Written = 0;
+
+    if (BatchSize <= 0) {
+        BatchSize = Count;
+    }
+
+    for (BatchStart = 0; BatchStart < Count; BatchStart = BatchEnd) {
+        BatchEnd = BatchStart + BatchSize;
+        if (BatchEnd > Count) {
+            BatchEnd = Count;
+        }
+
+        for (Index = BatchStart; Index < BatchEnd; ++Index) {
+            HMM_Quat Corrected;
+
+            if (HMM_OrthogonalizeQ(In[Index], PreserveHandedness, &Corrected)) {
+                Out[Written++] = Corrected;
+            } else if (SingularPolicy == HMM_ORTHO_REPORT_AND_ABORT) {
+                return Written;
+            }
+            /* HMM_ORTHO_SKIP_SINGULAR: leave it out of the compacted output. */
+        }
+    }
+
+    return Written;
+}
+
 
 COVERAGE(HMM_QFromAxisAngle_RH, 1)
 static inline HMM_Quat HMM_QFromAxisAngle_RH(HMM_Vec3 Axis, float Angle)
