@@ -3933,6 +3933,1123 @@ void __hmm_invalid_generic(void);
 
 #endif
 
+/*
+  =============================================================================
+  RAY / PRIMITIVE INTERSECTION AND BVH ACCELERATION
+  =============================================================================
+
+  This section is an additive extension: none of the functions above are
+  redefined or modified in any way.
+
+  It provides three-level ray casting against heterogeneous primitives
+  (axis-aligned boxes, spheres, planes):
+
+    1. A binary AABB bounding-volume hierarchy is built once over a scene.
+       Build time is O(n log n) (three O(n log n) sorts followed by one
+       linear merge per tree level, O(n log n) in total).
+    2. At query time a broad phase prunes whole subtrees with a cheap
+       ray/AABB slab test. It can be disabled with EnableBroadphase = 0,
+       which makes the query fall back to a linear scan through the leaves.
+    3. Only the primitives inside surviving leaf nodes are tested with the
+       exact intersection routines HMM_RayTraceAABB, HMM_RayTraceSphere and
+       HMM_RayTracePlane.
+
+  The exact leaf routines are also exposed individually; HMM_RayTracePrimitive
+  dispatches to them unchanged, so a caller doing one primitive at a time sees
+  exactly the same arithmetic as the accelerated path.
+
+  Zero direction vectors are an explicit error, not an undefined operation:
+  every public ray entry point returns a miss (HMM_RayHit with Hit == 0) when
+  Direction is the zero vector, including the three leaf routines, the
+  primitive dispatcher and the BVH query.
+
+  Ray directions are assumed to be normalized for sphere and plane hits,
+  because the reported T is a geometric distance. The routines never
+  normalize the direction themselves.
+
+  The BVH owns the memory it allocates; release it with HMM_BVHFree. The
+  primitive array passed to HMM_BVHBuild is copied by value and only read
+  during the build, so the caller may free or reuse it afterwards.
+*/
+
+#include <stddef.h>
+#include <stdlib.h>
+
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
+#define HMM_BVH_INVALID_PRIM 0xFFFFFFFFu
+#define HMM_BVH_MAX_DEPTH 128
+#define HMM_BVH_DEFAULT_LEAF_CAPACITY 4
+
+/* Largest finite float, spelled out so no extra header is required. */
+#define HMM_BVH_FLT_MAX 3.402823466e38f
+
+/* Axis-aligned bounding box stored as its min and max corners. */
+typedef struct HMM_AABB
+{
+    HMM_Vec3 Min;
+    HMM_Vec3 Max;
+} HMM_AABB;
+
+/* A ray with an origin and a (preferably normalized) direction. */
+typedef struct HMM_Ray
+{
+    HMM_Vec3 Origin;
+    HMM_Vec3 Direction;
+} HMM_Ray;
+
+typedef enum HMM_PrimitiveType
+{
+    HMM_PRIM_INVALID = 0,
+    HMM_PRIM_AABB = 1,
+    HMM_PRIM_SPHERE = 2,
+    HMM_PRIM_PLANE = 3,
+} HMM_PrimitiveType;
+
+/*
+  An infinite plane with unit normal Normal containing point Point:
+  every X satisfies dot(Normal, X - Point) == 0.
+*/
+typedef struct HMM_Plane
+{
+    HMM_Vec3 Normal;
+    HMM_Vec3 Point;
+} HMM_Plane;
+
+/*
+  One scene object. Type selects which geometric field is used; UserIndex is
+  an opaque 16-bit value handed back unchanged in HMM_RayHit.PrimitiveIndex so
+  callers can identify their own objects.
+*/
+typedef struct HMM_BVHPrimitive
+{
+    int Type;
+    HMM_AABB AABB;
+    HMM_Vec3 Center;
+    float Radius;
+    HMM_Plane Plane;
+    unsigned short UserIndex;
+} HMM_BVHPrimitive;
+
+/* Result of an intersection query. Hit == 0 means "no intersection". */
+typedef struct HMM_RayHit
+{
+    int Hit;
+    float T;
+    HMM_Vec3 Point;
+    unsigned int Primitive; /* index into the array given to HMM_BVHBuild */
+    unsigned short UserIndex;
+} HMM_RayHit;
+
+typedef struct HMM_BVHConfig
+{
+    int EnableBroadphase; /* nonzero: prune subtrees with AABB tests */
+    int LeafCapacity; /* maximum primitives stored in one leaf */
+} HMM_BVHConfig;
+
+typedef struct HMM_BVHMemoryInfo
+{
+    size_t NodeBytes; /* tree node array */
+    size_t PrimitiveBytes; /* internal copy of the primitive array */
+    size_t IndexBytes; /* tree primitive permutation of indices */
+    size_t PlaneBytes; /* side list of plane primitive indices */
+    size_t ScratchPeakBytes; /* largest temporary allocation used by the build */
+    size_t TotalBytes; /* everything the BVH owns, scratch included */
+} HMM_BVHMemoryInfo;
+
+/*
+  Broad-phase counters for one accelerated query, used to demonstrate
+  pruning. PrimitiveTests counts exact leaf intersection calls; AABBTests
+  counts broad-phase slab tests including the root; LeavesVisited counts the
+  leaf nodes whose primitives were tested; NodesVisited counts every node
+  reached, pruned or not.
+*/
+typedef struct HMM_BVHTraceStats
+{
+    int AABBTests;
+    int NodesVisited;
+    int LeavesVisited;
+    int PrimitiveTests;
+} HMM_BVHTraceStats;
+
+typedef struct HMM_BVHNode
+{
+    HMM_AABB Bounds;
+    int Left; /* child node index, or -1 for leaves */
+    int Right;
+    int First; /* leaf only: first range in HMM_BVH.PrimIndices */
+    int Count; /* leaf only: number of primitives, 0 for inner nodes */
+} HMM_BVHNode;
+
+typedef struct HMM_BVH
+{
+    HMM_BVHNode* Nodes;
+    HMM_BVHPrimitive* Primitives;
+    unsigned int* PrimIndices;
+    /*
+      Infinite planes cannot have a finite bounding box, so they never enter
+      the tree. They live in this side list and are tested linearly after
+      the broad phase finishes.
+    */
+    unsigned int* PlanePrimIndices;
+    unsigned int PlaneCount;
+    int NodeCount;
+    int NodeCap;
+    unsigned int PrimitiveCount;
+    HMM_BVHConfig Config;
+    size_t ScratchPeakBytes;
+} HMM_BVH;
+
+/* ------------------------------------------------------------------------- */
+/* Exact leaf intersection routines.                                         */
+/* All of them return a miss (Hit == 0) for zero-length directions.          */
+/* ------------------------------------------------------------------------- */
+
+/*
+  Slab test against an axis-aligned box. Returns nonzero when the ray enters
+  the box at a nonnegative distance, including the tangent case where the ray
+  just touches a face and rays whose origin is already inside the box; in
+  that case *OutT receives the entry distance. Boxes strictly behind the ray
+  are rejected, so the same routine drives both the broad phase and the exact
+  AABB intersection without any disagreement.
+*/
+static inline int HMM_RayAABBSlab(HMM_Ray Ray, HMM_AABB Box, float* OutT)
+{
+    float TMin = 0.0f;
+    float TMax = HMM_BVH_FLT_MAX;
+    int Axis;
+
+    for (Axis = 0; Axis < 3; Axis++)
+    {
+        float Origin = Ray.Origin.Elements[Axis];
+        float Dir = Ray.Direction.Elements[Axis];
+        float Lo = Box.Min.Elements[Axis];
+        float Hi = Box.Max.Elements[Axis];
+        float T1, T2;
+
+        if (Dir == 0.0f)
+        {
+            /* Parallel to this pair of slabs: the origin must lie inside. */
+            if (Origin < Lo || Origin > Hi)
+            {
+                return 0;
+            }
+            continue;
+        }
+
+        T1 = (Lo - Origin) / Dir;
+        T2 = (Hi - Origin) / Dir;
+        if (T1 > T2)
+        {
+            float Swap = T1;
+            T1 = T2;
+            T2 = Swap;
+        }
+
+        if (T1 > TMin)
+        {
+            TMin = T1;
+        }
+        if (T2 < TMax)
+        {
+            TMax = T2;
+        }
+
+        if (TMin > TMax)
+        {
+            return 0;
+        }
+    }
+
+    if (OutT != NULL)
+    {
+        *OutT = TMin;
+    }
+    return 1;
+}
+
+/*
+  Broad-phase predicate: may the forward ray pierce the box? Rays starting
+  inside the box count as a hit. The zero vector is not a direction, so it
+  always misses.
+*/
+static inline int HMM_RayTraceAABBNode(HMM_Ray Ray, HMM_AABB Box)
+{
+    if (Ray.Direction.X == 0.0f && Ray.Direction.Y == 0.0f &&
+        Ray.Direction.Z == 0.0f)
+    {
+        return 0;
+    }
+    return HMM_RayAABBSlab(Ray, Box, NULL);
+}
+
+/* Exact intersection of a ray with an axis-aligned box. */
+static inline HMM_RayHit HMM_RayTraceAABB(HMM_Ray Ray, HMM_AABB Box)
+{
+    HMM_RayHit Result;
+    float T = 0.0f;
+
+    Result.Hit = 0;
+    Result.T = 0.0f;
+    Result.Point = HMM_V3(0.0f, 0.0f, 0.0f);
+    Result.Primitive = HMM_BVH_INVALID_PRIM;
+    Result.UserIndex = 0;
+
+    if (Ray.Direction.X == 0.0f && Ray.Direction.Y == 0.0f &&
+        Ray.Direction.Z == 0.0f)
+    {
+        return Result;
+    }
+
+    if (!HMM_RayAABBSlab(Ray, Box, &T) || T < 0.0f)
+    {
+        return Result;
+    }
+
+    Result.Hit = 1;
+    Result.T = T;
+    Result.Point = HMM_AddV3(Ray.Origin, HMM_MulV3F(Ray.Direction, T));
+    return Result;
+}
+
+/* Exact intersection of a ray with a sphere. Tangent rays report one hit. */
+static inline HMM_RayHit HMM_RayTraceSphere(HMM_Ray Ray, HMM_Vec3 Center,
+                                            float Radius)
+{
+    HMM_Vec3 Offset;
+    float B, C, Discriminant, Root, T;
+    HMM_RayHit Result;
+
+    Result.Hit = 0;
+    Result.T = 0.0f;
+    Result.Point = HMM_V3(0.0f, 0.0f, 0.0f);
+    Result.Primitive = HMM_BVH_INVALID_PRIM;
+    Result.UserIndex = 0;
+
+    if (Ray.Direction.X == 0.0f && Ray.Direction.Y == 0.0f &&
+        Ray.Direction.Z == 0.0f)
+    {
+        return Result;
+    }
+
+    Offset = HMM_SubV3(Ray.Origin, Center);
+    B = HMM_DotV3(Offset, Ray.Direction);
+    C = HMM_DotV3(Offset, Offset) - Radius * Radius;
+    Discriminant = B * B - C;
+    if (Discriminant < 0.0f)
+    {
+        return Result;
+    }
+
+    Root = HMM_SQRTF(Discriminant);
+    T = -B - Root;
+    if (T < 0.0f)
+    {
+        T = -B + Root;
+        if (T < 0.0f)
+        {
+            return Result;
+        }
+    }
+
+    Result.Hit = 1;
+    Result.T = T;
+    Result.Point = HMM_AddV3(Ray.Origin, HMM_MulV3F(Ray.Direction, T));
+    return Result;
+}
+
+/*
+  Exact intersection of a ray with an infinite plane. A ray parallel to the
+  plane never hits, even when its origin lies on the plane: grazing contact
+  without a crossing point is not a well-defined intersection.
+*/
+static inline HMM_RayHit HMM_RayTracePlane(HMM_Ray Ray, HMM_Plane Plane)
+{
+    float Denom, T;
+    HMM_RayHit Result;
+
+    Result.Hit = 0;
+    Result.T = 0.0f;
+    Result.Point = HMM_V3(0.0f, 0.0f, 0.0f);
+    Result.Primitive = HMM_BVH_INVALID_PRIM;
+    Result.UserIndex = 0;
+
+    if (Ray.Direction.X == 0.0f && Ray.Direction.Y == 0.0f &&
+        Ray.Direction.Z == 0.0f)
+    {
+        return Result;
+    }
+
+    Denom = HMM_DotV3(Plane.Normal, Ray.Direction);
+    if (Denom == 0.0f)
+    {
+        return Result;
+    }
+
+    T = HMM_DotV3(HMM_SubV3(Plane.Point, Ray.Origin), Plane.Normal) / Denom;
+    if (T < 0.0f)
+    {
+        return Result;
+    }
+
+    Result.Hit = 1;
+    Result.T = T;
+    Result.Point = HMM_AddV3(Ray.Origin, HMM_MulV3F(Ray.Direction, T));
+    return Result;
+}
+
+/* Dispatch to the exact routine matching Primitive.Type. */
+static inline HMM_RayHit HMM_RayTracePrimitive(HMM_Ray Ray,
+                                               HMM_BVHPrimitive Primitive)
+{
+    HMM_RayHit Result;
+
+    switch (Primitive.Type)
+    {
+        case HMM_PRIM_AABB:
+            Result = HMM_RayTraceAABB(Ray, Primitive.AABB);
+            break;
+        case HMM_PRIM_SPHERE:
+            Result = HMM_RayTraceSphere(Ray, Primitive.Center,
+                                        Primitive.Radius);
+            break;
+        case HMM_PRIM_PLANE:
+            Result = HMM_RayTracePlane(Ray, Primitive.Plane);
+            break;
+        default:
+            Result.Hit = 0;
+            Result.T = 0.0f;
+            Result.Point = HMM_V3(0.0f, 0.0f, 0.0f);
+            Result.Primitive = HMM_BVH_INVALID_PRIM;
+            Result.UserIndex = 0;
+            break;
+    }
+
+    return Result;
+}
+
+/* ------------------------------------------------------------------------- */
+/* O(n log n) BVH construction.                                              */
+/*                                                                           */
+/* Indices are sorted once per axis by centroid. Each recursive level keeps */
+/* its index range sorted by the split axis through a linear merge, so the  */
+/* overall work is the three initial sorts plus O(n) per level: O(n log n). */
+/* ------------------------------------------------------------------------- */
+
+typedef struct HMM_BVHBuildItem
+{
+    HMM_BVHPrimitive Prim;
+    HMM_AABB Bounds;
+    HMM_Vec3 Centroid;
+    unsigned int OriginalIndex;
+} HMM_BVHBuildItem;
+
+typedef struct HMM_BVHBuildContext
+{
+    HMM_BVHBuildItem* Items;
+    unsigned int* Order;
+    unsigned int* Sorted[3];
+    unsigned int* Temp;
+    unsigned char* Side;
+    HMM_BVH* Tree;
+    int LeafCapacity;
+} HMM_BVHBuildContext;
+
+static HMM_BVHBuildItem* Hmm_BVHBuildSortItems = NULL;
+static int Hmm_BVHBuildSortAxis = 0;
+
+static inline int Hmm_BVHCompareIndices(const void* A, const void* B)
+{
+    unsigned int IA = *((const unsigned int*) A);
+    unsigned int IB = *((const unsigned int*) B);
+    float CA = Hmm_BVHBuildSortItems[IA].Centroid.Elements[Hmm_BVHBuildSortAxis];
+    float CB = Hmm_BVHBuildSortItems[IB].Centroid.Elements[Hmm_BVHBuildSortAxis];
+
+    if (CA < CB)
+    {
+        return -1;
+    }
+    if (CA > CB)
+    {
+        return 1;
+    }
+    if (IA < IB)
+    {
+        return -1;
+    }
+    if (IA > IB)
+    {
+        return 1;
+    }
+    return 0;
+}
+
+static inline HMM_AABB Hmm_BVHEmptyAABB(void)
+{
+    HMM_AABB Bounds;
+    Bounds.Min = HMM_V3(HMM_BVH_FLT_MAX, HMM_BVH_FLT_MAX, HMM_BVH_FLT_MAX);
+    Bounds.Max = HMM_V3(-HMM_BVH_FLT_MAX, -HMM_BVH_FLT_MAX,
+                        -HMM_BVH_FLT_MAX);
+    return Bounds;
+}
+
+static inline int Hmm_BVHIsEmptyAABB(HMM_AABB Bounds)
+{
+    return Bounds.Min.X > Bounds.Max.X || Bounds.Min.Y > Bounds.Max.Y ||
+           Bounds.Min.Z > Bounds.Max.Z;
+}
+
+static inline HMM_AABB Hmm_BVHUnionAABB(HMM_AABB A, HMM_AABB B)
+{
+    HMM_AABB Result;
+    int Axis;
+
+    if (Hmm_BVHIsEmptyAABB(A))
+    {
+        return B;
+    }
+    if (Hmm_BVHIsEmptyAABB(B))
+    {
+        return A;
+    }
+
+    for (Axis = 0; Axis < 3; Axis++)
+    {
+        Result.Min.Elements[Axis] =
+            HMM_MIN(A.Min.Elements[Axis], B.Min.Elements[Axis]);
+        Result.Max.Elements[Axis] =
+            HMM_MAX(A.Max.Elements[Axis], B.Max.Elements[Axis]);
+    }
+    return Result;
+}
+
+static inline HMM_AABB Hmm_BVHPrimitiveBounds(const HMM_BVHPrimitive* Primitive)
+{
+    HMM_AABB Bounds = Hmm_BVHEmptyAABB();
+    HMM_Vec3 Half;
+
+    switch (Primitive->Type)
+    {
+        case HMM_PRIM_AABB:
+            Bounds = Primitive->AABB;
+            break;
+        case HMM_PRIM_SPHERE:
+            Half = HMM_V3(Primitive->Radius, Primitive->Radius,
+                          Primitive->Radius);
+            Bounds.Min = HMM_SubV3(Primitive->Center, Half);
+            Bounds.Max = HMM_AddV3(Primitive->Center, Half);
+            break;
+        case HMM_PRIM_PLANE:
+            /*
+              An infinite plane has no finite box. It is kept out of the
+              tree entirely and lives in the BVH's plane side list instead,
+              so here it contributes no bounds.
+            */
+            break;
+        default:
+            break;
+    }
+
+    return Bounds;
+}
+
+static inline int Hmm_BVHNewNode(HMM_BVHBuildContext* Ctx)
+{
+    int Index = Ctx->Tree->NodeCount;
+    if (Index >= Ctx->Tree->NodeCap)
+    {
+        return -1;
+    }
+
+    Ctx->Tree->Nodes[Index].Bounds = Hmm_BVHEmptyAABB();
+    Ctx->Tree->Nodes[Index].Left = -1;
+    Ctx->Tree->Nodes[Index].Right = -1;
+    Ctx->Tree->Nodes[Index].First = -1;
+    Ctx->Tree->Nodes[Index].Count = 0;
+    Ctx->Tree->NodeCount++;
+    return Index;
+}
+
+/*
+  Stable partition of the Count indices in Source[Start .. Start+Count) into
+  Temp: side 0 first, side 1 second, each group keeping its input order. The
+  result is copied back so Source remains usable as scratch on the way up.
+*/
+static inline void Hmm_BVHStablePartition(HMM_BVHBuildContext* Ctx,
+                                   unsigned int* Source, int Start, int Count,
+                                   const unsigned char* Side)
+{
+    int I, Lo = 0, Hi = Count;
+
+    for (I = 0; I < Count; I++)
+    {
+        unsigned int Index = Source[Start + I];
+        if (Side[Index] == 0)
+        {
+            Ctx->Temp[Start + Lo] = Index;
+            Lo++;
+        }
+        else
+        {
+            Ctx->Temp[Start + Hi - 1] = Index;
+            Hi--;
+        }
+    }
+
+    /*
+      The second half was filled backwards, so reverse it in place with swaps
+      to restore the original relative ordering within that group.
+    */
+    for (I = 0; I < (Count - Hi) / 2; I++)
+    {
+        int A = Start + Hi + I;
+        int B = Start + Count - 1 - I;
+        unsigned int Swap = Ctx->Temp[A];
+        Ctx->Temp[A] = Ctx->Temp[B];
+        Ctx->Temp[B] = Swap;
+    }
+
+    for (I = 0; I < Count; I++)
+    {
+        Source[Start + I] = Ctx->Temp[Start + I];
+    }
+}
+
+static inline int Hmm_BVHBuildRec(HMM_BVHBuildContext* Ctx, int Start, int Count,
+                           int Depth)
+{
+    int NodeIndex = Hmm_BVHNewNode(Ctx);
+    HMM_BVHNode* Node;
+    int I;
+    HMM_AABB Bounds = Hmm_BVHEmptyAABB();
+    HMM_AABB CentroidBounds = Hmm_BVHEmptyAABB();
+
+    if (NodeIndex < 0)
+    {
+        return -1;
+    }
+    Node = &Ctx->Tree->Nodes[NodeIndex];
+
+    for (I = 0; I < Count; I++)
+    {
+        unsigned int ItemIndex = Ctx->Order[Start + I];
+        Bounds = Hmm_BVHUnionAABB(Bounds, Ctx->Items[ItemIndex].Bounds);
+
+        {
+            HMM_AABB PointBox;
+            PointBox.Min = Ctx->Items[ItemIndex].Centroid;
+            PointBox.Max = Ctx->Items[ItemIndex].Centroid;
+            CentroidBounds = Hmm_BVHUnionAABB(CentroidBounds, PointBox);
+        }
+    }
+    Node->Bounds = Bounds;
+
+    if (Count <= Ctx->LeafCapacity || Depth >= HMM_BVH_MAX_DEPTH)
+    {
+        Node->First = Start;
+        Node->Count = Count;
+        return NodeIndex;
+    }
+
+    {
+        float ExtentX = CentroidBounds.Max.X - CentroidBounds.Min.X;
+        float ExtentY = CentroidBounds.Max.Y - CentroidBounds.Min.Y;
+        float ExtentZ = CentroidBounds.Max.Z - CentroidBounds.Min.Z;
+        int Axis = 0;
+        int LeftCount;
+        unsigned char* Side;
+        int Left, Right;
+
+        if (ExtentY > ExtentX)
+        {
+            Axis = 1;
+        }
+        if (ExtentZ > (Axis == 0 ? ExtentX : ExtentY))
+        {
+            Axis = 2;
+        }
+
+        /*
+          Sorted[Axis] holds every index ordered by this axis. Splitting at
+          the median position always yields Count/2 left items; equal
+          centroid coordinates keep their relative order through the stable
+          partition, so the tree stays balanced even on degenerate input.
+        */
+        LeftCount = Count / 2;
+
+        Side = Ctx->Side;
+        for (I = 0; I < Count; I++)
+        {
+            unsigned int ItemIndex = Ctx->Sorted[Axis][Start + I];
+            Side[ItemIndex] = (I < LeftCount) ? 0 : 1;
+        }
+
+        Hmm_BVHStablePartition(Ctx, Ctx->Order, Start, Count, Side);
+        for (I = 0; I < 3; I++)
+        {
+            Hmm_BVHStablePartition(Ctx, Ctx->Sorted[I], Start, Count, Side);
+        }
+
+        Left = Hmm_BVHBuildRec(Ctx, Start, LeftCount, Depth + 1);
+        if (Left < 0)
+        {
+            return -1;
+        }
+        Right = Hmm_BVHBuildRec(Ctx, Start + LeftCount, Count - LeftCount,
+                                Depth + 1);
+        if (Right < 0)
+        {
+            return -1;
+        }
+
+        Node->Left = Left;
+        Node->Right = Right;
+    }
+
+    return NodeIndex;
+}
+
+static inline HMM_BVHConfig HMM_BVHDefaultConfig(void)
+{
+    HMM_BVHConfig Config;
+    Config.EnableBroadphase = 1;
+    Config.LeafCapacity = HMM_BVH_DEFAULT_LEAF_CAPACITY;
+    return Config;
+}
+
+static inline void HMM_BVHFree(HMM_BVH* Tree);
+
+/*
+  Builds a BVH over Count primitives in O(n log n). Returns a zeroed tree
+  with Nodes == NULL on allocation failure or invalid arguments. A build over
+  zero primitives succeeds and produces an empty tree whose queries all miss.
+*/
+static inline HMM_BVH HMM_BVHBuild(const HMM_BVHPrimitive* Primitives,
+                            unsigned int Count, HMM_BVHConfig Config)
+{
+    HMM_BVH Tree;
+    HMM_BVHBuildContext Ctx;
+    size_t ItemBytes, IndexBytes, NodeBytes, ScratchPeak = 0;
+    size_t SideBytes, PlaneBytes;
+    unsigned int I;
+    unsigned int BoundedCount = 0;
+    unsigned int PlaneCount = 0;
+    int Axis;
+
+    Tree.Nodes = NULL;
+    Tree.Primitives = NULL;
+    Tree.PrimIndices = NULL;
+    Tree.PlanePrimIndices = NULL;
+    Tree.PlaneCount = 0;
+    Tree.NodeCount = 0;
+    Tree.NodeCap = 0;
+    Tree.PrimitiveCount = 0;
+    Tree.Config = Config;
+    Tree.ScratchPeakBytes = 0;
+
+    if (Config.LeafCapacity < 1)
+    {
+        Tree.Config = HMM_BVHDefaultConfig();
+    }
+    if (Count > 0 && Primitives == NULL)
+    {
+        return Tree;
+    }
+
+    for (I = 0; I < Count; I++)
+    {
+        if (Primitives[I].Type == HMM_PRIM_PLANE)
+        {
+            PlaneCount++;
+        }
+        else
+        {
+            BoundedCount++;
+        }
+    }
+
+    ItemBytes = (size_t) BoundedCount * sizeof(HMM_BVHBuildItem);
+    IndexBytes = (size_t) BoundedCount * sizeof(unsigned int);
+    SideBytes = (size_t) BoundedCount * sizeof(unsigned char);
+    PlaneBytes = (size_t) PlaneCount * sizeof(unsigned int);
+    NodeBytes = (size_t)(BoundedCount > 0 ? 2 * (int) BoundedCount : 1) *
+                sizeof(HMM_BVHNode);
+
+    Tree.Primitives = (HMM_BVHPrimitive*) malloc(
+        (size_t) Count * sizeof(HMM_BVHPrimitive));
+    Tree.PrimIndices = (unsigned int*) malloc(
+        IndexBytes > 0 ? IndexBytes : 1);
+    Tree.PlanePrimIndices = (unsigned int*) malloc(
+        PlaneBytes > 0 ? PlaneBytes : 1);
+    Ctx.Items = (HMM_BVHBuildItem*) malloc(ItemBytes > 0 ? ItemBytes : 1);
+    Ctx.Order = (unsigned int*) malloc(IndexBytes > 0 ? IndexBytes : 1);
+    Ctx.Sorted[0] = (unsigned int*) malloc(IndexBytes > 0 ? IndexBytes : 1);
+    Ctx.Sorted[1] = (unsigned int*) malloc(IndexBytes > 0 ? IndexBytes : 1);
+    Ctx.Sorted[2] = (unsigned int*) malloc(IndexBytes > 0 ? IndexBytes : 1);
+    /* Temp holds BoundedCount indices; Side is a separate one-byte flag. */
+    Ctx.Temp = (unsigned int*) malloc(IndexBytes > 0 ? IndexBytes : 1);
+    Ctx.Side = (unsigned char*) malloc(SideBytes > 0 ? SideBytes : 1);
+    Tree.Nodes = (HMM_BVHNode*) malloc(NodeBytes);
+
+    if ((Count > 0 && Tree.Primitives == NULL) ||
+        Tree.PrimIndices == NULL || Tree.PlanePrimIndices == NULL ||
+        Ctx.Items == NULL || Ctx.Order == NULL || Ctx.Sorted[0] == NULL ||
+        Ctx.Sorted[1] == NULL || Ctx.Sorted[2] == NULL ||
+        Ctx.Temp == NULL || Ctx.Side == NULL || Tree.Nodes == NULL)
+    {
+        free(Ctx.Items);
+        free(Ctx.Order);
+        free(Ctx.Sorted[0]);
+        free(Ctx.Sorted[1]);
+        free(Ctx.Sorted[2]);
+        free(Ctx.Temp);
+        free(Ctx.Side);
+        free(Tree.Nodes);
+        free(Tree.Primitives);
+        free(Tree.PrimIndices);
+        free(Tree.PlanePrimIndices);
+        Tree.Nodes = NULL;
+        Tree.Primitives = NULL;
+        Tree.PrimIndices = NULL;
+        Tree.PlanePrimIndices = NULL;
+        return Tree;
+    }
+
+    /*
+      Scratch peak: build items, five index-sized work arrays and the byte
+      side table. Allocated separately, so their sizes simply add up.
+    */
+    ScratchPeak = ItemBytes + IndexBytes * 5 + SideBytes;
+    Tree.ScratchPeakBytes = ScratchPeak;
+    Tree.NodeCap = BoundedCount > 0 ? 2 * (int) BoundedCount : 1;
+    Tree.PrimitiveCount = Count;
+    Tree.PlaneCount = PlaneCount;
+
+    /*
+      The full primitive array is copied in original order so hit indices
+      match the caller's array. Bounded primitives are additionally packed
+      into compact build items; planes go to the side list.
+    */
+    {
+        unsigned int Bounded = 0;
+        unsigned int Plane = 0;
+        for (I = 0; I < Count; I++)
+        {
+            Tree.Primitives[I] = Primitives[I];
+            if (Primitives[I].Type == HMM_PRIM_PLANE)
+            {
+                Tree.PlanePrimIndices[Plane++] = I;
+                continue;
+            }
+
+            Ctx.Items[Bounded].Prim = Primitives[I];
+            Ctx.Items[Bounded].Bounds =
+                Hmm_BVHPrimitiveBounds(&Primitives[I]);
+            Ctx.Items[Bounded].OriginalIndex = I;
+            Ctx.Items[Bounded].Centroid = Hmm_BVHIsEmptyAABB(
+                Ctx.Items[Bounded].Bounds)
+                ? HMM_V3(0.0f, 0.0f, 0.0f)
+                : HMM_MulV3F(
+                    HMM_AddV3(Ctx.Items[Bounded].Bounds.Min,
+                              Ctx.Items[Bounded].Bounds.Max),
+                    0.5f);
+            Ctx.Order[Bounded] = Bounded;
+            Bounded++;
+        }
+    }
+
+    Hmm_BVHBuildSortItems = Ctx.Items;
+    for (Axis = 0; Axis < 3; Axis++)
+    {
+        for (I = 0; I < BoundedCount; I++)
+        {
+            Ctx.Sorted[Axis][I] = I;
+        }
+        Hmm_BVHBuildSortAxis = Axis;
+        qsort(Ctx.Sorted[Axis], BoundedCount, sizeof(unsigned int),
+              Hmm_BVHCompareIndices);
+    }
+    Hmm_BVHBuildSortItems = NULL;
+
+    Ctx.Tree = &Tree;
+    Ctx.LeafCapacity = Tree.Config.LeafCapacity;
+
+    if (BoundedCount > 0)
+    {
+        if (Hmm_BVHBuildRec(&Ctx, 0, (int) BoundedCount, 0) < 0)
+        {
+            free(Ctx.Items);
+            free(Ctx.Order);
+            free(Ctx.Sorted[0]);
+            free(Ctx.Sorted[1]);
+            free(Ctx.Sorted[2]);
+            free(Ctx.Temp);
+            free(Ctx.Side);
+            HMM_BVHFree(&Tree);
+            return Tree;
+        }
+    }
+
+    /*
+      The leaves index into this permutation of compact build positions,
+      each holding the original primitive index in OriginalIndex.
+    */
+    for (I = 0; I < BoundedCount; I++)
+    {
+        Tree.PrimIndices[I] = Ctx.Items[Ctx.Order[I]].OriginalIndex;
+    }
+
+    free(Ctx.Items);
+    free(Ctx.Order);
+    free(Ctx.Sorted[0]);
+    free(Ctx.Sorted[1]);
+    free(Ctx.Sorted[2]);
+    free(Ctx.Temp);
+    free(Ctx.Side);
+
+    return Tree;
+}
+
+static inline void HMM_BVHFree(HMM_BVH* Tree)
+{
+    if (Tree == NULL)
+    {
+        return;
+    }
+    free(Tree->Nodes);
+    free(Tree->Primitives);
+    free(Tree->PrimIndices);
+    free(Tree->PlanePrimIndices);
+    Tree->Nodes = NULL;
+    Tree->Primitives = NULL;
+    Tree->PrimIndices = NULL;
+    Tree->PlanePrimIndices = NULL;
+    Tree->NodeCount = 0;
+    Tree->NodeCap = 0;
+    Tree->PrimitiveCount = 0;
+    Tree->PlaneCount = 0;
+    Tree->ScratchPeakBytes = 0;
+}
+
+static inline HMM_BVHMemoryInfo HMM_BVHGetMemoryInfo(const HMM_BVH* Tree)
+{
+    HMM_BVHMemoryInfo Info;
+
+    Info.NodeBytes = (size_t) Tree->NodeCap * sizeof(HMM_BVHNode);
+    Info.PrimitiveBytes =
+        (size_t) Tree->PrimitiveCount * sizeof(HMM_BVHPrimitive);
+    Info.IndexBytes =
+        (size_t)(Tree->PrimitiveCount - Tree->PlaneCount) *
+        sizeof(unsigned int);
+    Info.PlaneBytes =
+        (size_t) Tree->PlaneCount * sizeof(unsigned int);
+    Info.ScratchPeakBytes = Tree->ScratchPeakBytes;
+    Info.TotalBytes = Info.NodeBytes + Info.PrimitiveBytes +
+                      Info.IndexBytes + Info.PlaneBytes +
+                      Info.ScratchPeakBytes;
+    return Info;
+}
+
+/* Reference path: exact test of every primitive in original array order. */
+static inline HMM_RayHit HMM_BVHTraceBruteforce(const HMM_BVH* Tree, HMM_Ray Ray)
+{
+    HMM_RayHit Best;
+    unsigned int I;
+
+    Best.Hit = 0;
+    Best.T = 0.0f;
+    Best.Point = HMM_V3(0.0f, 0.0f, 0.0f);
+    Best.Primitive = HMM_BVH_INVALID_PRIM;
+    Best.UserIndex = 0;
+
+    for (I = 0; I < Tree->PrimitiveCount; I++)
+    {
+        HMM_RayHit Hit = HMM_RayTracePrimitive(Ray, Tree->Primitives[I]);
+        if (Hit.Hit &&
+            (!Best.Hit || Hit.T < Best.T ||
+             (Hit.T == Best.T && I < Best.Primitive)))
+        {
+            Hit.Primitive = I;
+            Hit.UserIndex = Tree->Primitives[I].UserIndex;
+            Best = Hit;
+        }
+    }
+
+    return Best;
+}
+
+/*
+  Exact test of the planes in the side list, folded into the running best hit
+  with the same nearest-tie rule as every other path.
+*/
+static inline void Hmm_BVHTracePlanes(const HMM_BVH* Tree, HMM_Ray Ray,
+                                      HMM_RayHit* Best,
+                                      HMM_BVHTraceStats* Stats)
+{
+    unsigned int I;
+
+    for (I = 0; I < Tree->PlaneCount; I++)
+    {
+        unsigned int PrimIndex = Tree->PlanePrimIndices[I];
+        HMM_RayHit Hit =
+            HMM_RayTracePrimitive(Ray, Tree->Primitives[PrimIndex]);
+
+        if (Stats != NULL)
+        {
+            Stats->PrimitiveTests++;
+        }
+
+        if (Hit.Hit &&
+            (!Best->Hit || Hit.T < Best->T ||
+             (Hit.T == Best->T && PrimIndex < Best->Primitive)))
+        {
+            Hit.Primitive = PrimIndex;
+            Hit.UserIndex = Tree->Primitives[PrimIndex].UserIndex;
+            *Best = Hit;
+        }
+    }
+}
+
+/*
+  Accelerated query with broad-phase accounting. A NULL Stats pointer simply
+  skips the counters. With EnableBroadphase off every primitive is tested in
+  order and the reported counts reflect that linear scan.
+
+  A zero direction vector is explicitly a miss.
+*/
+static inline HMM_RayHit HMM_BVHTraceDetailed(const HMM_BVH* Tree, HMM_Ray Ray,
+                                              HMM_BVHTraceStats* Stats)
+{
+    HMM_RayHit Best;
+
+    Best.Hit = 0;
+    Best.T = 0.0f;
+    Best.Point = HMM_V3(0.0f, 0.0f, 0.0f);
+    Best.Primitive = HMM_BVH_INVALID_PRIM;
+    Best.UserIndex = 0;
+
+    if (Stats != NULL)
+    {
+        Stats->AABBTests = 0;
+        Stats->NodesVisited = 0;
+        Stats->LeavesVisited = 0;
+        Stats->PrimitiveTests = 0;
+    }
+
+    if (Tree == NULL || Tree->Nodes == NULL)
+    {
+        return Best;
+    }
+
+    if (Ray.Direction.X == 0.0f && Ray.Direction.Y == 0.0f &&
+        Ray.Direction.Z == 0.0f)
+    {
+        return Best;
+    }
+
+    if (!Tree->Config.EnableBroadphase)
+    {
+        Best = HMM_BVHTraceBruteforce(Tree, Ray);
+        if (Stats != NULL)
+        {
+            Stats->PrimitiveTests = (int) Tree->PrimitiveCount;
+        }
+        return Best;
+    }
+
+    if (Tree->NodeCount > 0)
+    {
+        int Stack[2 * (HMM_BVH_MAX_DEPTH + 2)];
+        int StackCap = (int) (sizeof(Stack) / sizeof(Stack[0]));
+        int Top = 0;
+        Stack[Top++] = 0;
+
+        while (Top > 0)
+        {
+            int NodeIndex = Stack[--Top];
+            const HMM_BVHNode* Node = &Tree->Nodes[NodeIndex];
+
+            if (Stats != NULL)
+            {
+                Stats->NodesVisited++;
+                Stats->AABBTests++;
+            }
+
+            /* Broad phase: prune the whole subtree on one slab test. */
+            if (!HMM_RayTraceAABBNode(Ray, Node->Bounds))
+            {
+                continue;
+            }
+
+            if (Node->Count > 0)
+            {
+                int K;
+                if (Stats != NULL)
+                {
+                    Stats->LeavesVisited++;
+                }
+                for (K = 0; K < Node->Count; K++)
+                {
+                    unsigned int PrimIndex =
+                        Tree->PrimIndices[Node->First + K];
+                    HMM_RayHit Hit = HMM_RayTracePrimitive(
+                        Ray, Tree->Primitives[PrimIndex]);
+
+                    if (Stats != NULL)
+                    {
+                        Stats->PrimitiveTests++;
+                    }
+
+                    if (Hit.Hit &&
+                        (!Best.Hit || Hit.T < Best.T ||
+                         (Hit.T == Best.T && PrimIndex < Best.Primitive)))
+                    {
+                        Hit.Primitive = PrimIndex;
+                        Hit.UserIndex =
+                            Tree->Primitives[PrimIndex].UserIndex;
+                        Best = Hit;
+                    }
+                }
+            }
+            else
+            {
+                if (Top + 2 > StackCap)
+                {
+                    /* Defensive: a tree capped at HMM_BVH_MAX_DEPTH cannot
+                       reach this; drop the subtree rather than overflow. */
+                    continue;
+                }
+                Stack[Top++] = Node->Left;
+                Stack[Top++] = Node->Right;
+            }
+        }
+    }
+
+    /* Infinite planes are unbounded and therefore never enter the tree. */
+    Hmm_BVHTracePlanes(Tree, Ray, &Best, Stats);
+
+    return Best;
+}
+
+/*
+  Accelerated query. With EnableBroadphase off it degenerates to the linear
+  reference path, bit for bit. With it on, subtrees are pruned by the slab
+  test and only surviving leaves run the exact primitive routines.
+
+  A zero direction vector is explicitly a miss.
+*/
+static inline HMM_RayHit HMM_BVHTrace(const HMM_BVH* Tree, HMM_Ray Ray)
+{
+    return HMM_BVHTraceDetailed(Tree, Ray, NULL);
+}
+
+#ifdef __cplusplus
+}
+#endif
+
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic pop
 #endif
